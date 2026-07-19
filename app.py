@@ -16,7 +16,7 @@ from database import (
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.6.0-no-lock-loading"
+APP_VERSION = "3.7.0-dashboard-items-confidence"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
 st.caption("오늘 등록·진입·피크·판매잔여일을 한눈에 · 대량수집 이어받기")
@@ -118,6 +118,59 @@ def _display_table(df: pd.DataFrame, columns: list[str], height: int = 330):
         if c in view.columns: view[c]=view[c].apply(_fmt_date)
     st.dataframe(view, hide_index=True, use_container_width=True, height=height)
 
+
+
+def _confidence_badge(v):
+    try:
+        score=float(v or 0)
+    except Exception:
+        score=0.0
+    if score >= 90:
+        return "🟢", "A", score
+    if score >= 75:
+        return "🟡", "B", score
+    if score >= 60:
+        return "🟠", "C", score
+    return "🔴", "D", score
+
+def _d_text(v, label):
+    if v is None or pd.isna(v):
+        return f"{label} -"
+    try:
+        n=int(v)
+    except Exception:
+        return f"{label} -"
+    if n == 0:
+        return f"{label} 오늘"
+    if n > 0:
+        return f"{label} D-{n}"
+    return f"{label} D+{abs(n)}"
+
+def _compact_items(df: pd.DataFrame, mode: str, limit: int = 12):
+    if df.empty:
+        st.caption("해당 품목 없음")
+        return
+    rows=[]
+    for _,r in df.head(limit).iterrows():
+        dot,grade,score=_confidence_badge(r.get("season_type_confidence"))
+        name=str(r.get("search_keyword") or "-")
+        if mode == "upload":
+            detail=f"{_d_text(r.get('진입까지'),'진입')} · {_d_text(r.get('피크까지'),'피크')} · 판매 {int(r.get('남은판매일') or 0)}일"
+        elif mode == "entry":
+            detail=f"피크 {_d_text(r.get('피크까지'),'').replace('  ',' ').strip()} · 판매 {int(r.get('남은판매일') or 0)}일"
+        elif mode == "selling":
+            detail=f"{r.get('단계','-')} · 피크 {_fmt_date(r.get('expected_peak_date'))} · 판매 {int(r.get('남은판매일') or 0)}일"
+        elif mode == "preparing":
+            detail=f"{_d_text(r.get('진입까지'),'진입')} · 피크 {_fmt_date(r.get('expected_peak_date'))}"
+        elif mode == "next30":
+            detail=f"{_d_text(r.get('등록까지'),'등록')} · {_d_text(r.get('진입까지'),'진입')}"
+        else:
+            detail=f"등록 {_fmt_date(r.get('recommended_upload_date'))} · 진입 {_fmt_date(r.get('entry_date'))} · 피크 {_fmt_date(r.get('expected_peak_date'))}"
+        rows.append(f"<div style='padding:7px 0;border-bottom:1px solid rgba(128,128,128,.18);font-size:0.94rem'><b>{dot} {name}</b> <span style='opacity:.72'>[{grade} {score:.0f}]</span><br><span style='opacity:.78'>{detail}</span></div>")
+    st.markdown("".join(rows),unsafe_allow_html=True)
+    if len(df)>limit:
+        st.caption(f"외 {len(df)-limit:,}개 · 아래 상세표에서 전체 확인")
+
 def result_card(r):
     st.subheader(f"{r['search_keyword']} 시즌 판단")
     c=st.columns(4)
@@ -159,6 +212,26 @@ with tabs[0]:
         m[3].metric("지금 준비 중",f"{len(preparing):,}개")
         m[4].metric("30일 내 준비",f"{len(next30):,}개")
         m[5].metric("사계절형",f"{len(evergreen):,}개")
+
+        st.markdown("#### 숫자 바로 아래 품목 요약")
+        c1,c2=st.columns(2)
+        with c1:
+            st.markdown(f"##### 🔥 오늘 등록 {len(today_upload):,}개")
+            _compact_items(today_upload.sort_values(["진입까지","expected_peak_date"]),"upload")
+            st.markdown(f"##### 🚪 오늘 진입 {len(today_entry):,}개")
+            _compact_items(today_entry.sort_values(["피크까지","expected_end_date"]),"entry")
+            st.markdown(f"##### 🧰 지금 준비 중 {len(preparing):,}개")
+            _compact_items(preparing.sort_values(["진입까지","expected_peak_date"]),"preparing")
+        with c2:
+            st.markdown(f"##### 🛒 현재 판매 중 {len(selling):,}개")
+            _compact_items(selling.sort_values(["남은판매일","expected_peak_date"]),"selling")
+            st.markdown(f"##### ⏰ 30일 내 준비 {len(next30):,}개")
+            _compact_items(next30.sort_values(["등록까지","진입까지"]),"next30")
+
+        low_conf=view[pd.to_numeric(view["season_type_confidence"],errors="coerce").fillna(0)<75].copy()
+        st.markdown(f"### ⚠️ 검토 필요 · 신뢰도 B 미만 {len(low_conf):,}개")
+        st.caption("🟢 A 90~100 · 🟡 B 75~89 · 🟠 C 60~74 · 🔴 D 60 미만")
+        _compact_items(low_conf.sort_values(["season_type_confidence","recommended_upload_date"]),"review",limit=20)
 
         st.markdown("### 🔥 오늘 등록할 품목")
         _display_table(today_upload.sort_values(["진입까지","expected_peak_date"]),
