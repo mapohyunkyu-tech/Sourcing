@@ -11,7 +11,17 @@ from settings_store import delete_credentials, load_settings, save_settings
 st.set_page_config(page_title="MarketScout 시즌 AI", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI")
 st.caption("품목 검색 → 최근 완료 3년 분석 → 진입일·피크일·후반 판매기간·종료일 판단")
-settings=load_settings(); db_df=load_database_df(); products=category_map()
+settings=load_settings()
+
+@st.cache_data(show_spinner=False)
+def cached_database_df():
+    return load_database_df()
+
+@st.cache_data(show_spinner=False)
+def cached_category_map():
+    return category_map()
+
+db_df=cached_database_df(); products=cached_category_map()
 
 def config_now():
     if settings.get("client_id") and settings.get("client_secret"):
@@ -49,7 +59,7 @@ with tabs[0]:
         with st.expander("새 품목 추가",expanded=True):
             c1,c2,c3=st.columns(3); cat=c1.selectbox("카테고리",categories()); rep=c2.text_input("대표품목",value=q.strip()); typ=c3.selectbox("유형",["미정","제철형","사계절형"])
             if st.button("추가 후 3년 분석",type="primary",disabled=config is None):
-                add_item(cat,rep,q.strip(),typ,"유통명" if rep!=q.strip() else "대표 원물명"); st.rerun()
+                add_item(cat,rep,q.strip(),typ,"유통명" if rep!=q.strip() else "대표 원물명"); cached_database_df.clear(); cached_category_map.clear(); st.rerun()
     elif not matches.empty:
         idx=st.selectbox("검색 결과",matches.index,format_func=lambda i:f"{matches.loc[i,'검색명']} · 대표 {matches.loc[i,'대표품목']} · {matches.loc[i,'카테고리']} · {matches.loc[i,'이름유형']}")
         s=matches.loc[idx]; st.success(f"DB 등록됨 · 대표품목 {s['대표품목']} · {s['카테고리']}")

@@ -6,7 +6,9 @@ import sqlite3
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "market_scout.db"
+DATA_DIR = Path.home() / ".marketscout"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "market_scout.db"
 MASTER_CSV = BASE_DIR / "item_master.csv"
 
 def connect():
