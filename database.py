@@ -12,8 +12,9 @@ DB_PATH = DATA_DIR / "market_scout.db"
 MASTER_CSV = BASE_DIR / "item_master.csv"
 
 def connect():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=15000")
     return con
 
 def ensure_schema():

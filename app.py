@@ -14,10 +14,10 @@ from database import (
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.0.0-resume"
+APP_VERSION = "3.1.0-loading-fix"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
-st.caption("5품목 묶음 수집 · 품목별 즉시 저장 · 429 중단 · 새 API 키로 이어받기")
+st.caption("5품목 묶음 수집 · 즉시 저장 · 이어받기 · 무한로딩 수정")
 settings = load_settings()
 
 @st.cache_data(show_spinner=False)
@@ -110,13 +110,24 @@ with tabs[0]:
         if not stopped: st.success(f"이번 실행 완료: 신규 저장 {done}개")
         st.caption("페이지를 새로고침하면 최신 진행 현황이 표시됩니다.")
 
-    qdf=queue_status_df()
-    if not qdf.empty:
-        filt=st.selectbox('대기열 보기',['전체','pending','completed','failed'])
-        view=qdf if filt=='전체' else qdf[qdf['상태']==filt]
-        st.dataframe(view,hide_index=True,use_container_width=True,height=420)
-    with st.expander("API 호출 로그"):
-        st.dataframe(api_log_df(),hide_index=True,use_container_width=True)
+    with st.expander("대기열 상세 보기", expanded=False):
+        st.caption("상세 목록은 이 영역을 열었을 때만 불러옵니다.")
+        if st.button("대기열 목록 불러오기", key="load_queue"):
+            st.session_state["show_queue"] = True
+        if st.session_state.get("show_queue"):
+            qdf=queue_status_df()
+            if not qdf.empty:
+                filt=st.selectbox('대기열 보기',['전체','pending','completed','failed'])
+                view=qdf if filt=='전체' else qdf[qdf['상태']==filt]
+                st.dataframe(view.head(1000),hide_index=True,use_container_width=True,height=420)
+                if len(view)>1000: st.caption(f"화면에는 처음 1,000개만 표시합니다. 전체 {len(view):,}개")
+            else:
+                st.info("대기열이 비어 있습니다.")
+    with st.expander("API 호출 로그", expanded=False):
+        if st.button("호출 로그 불러오기", key="load_logs"):
+            st.session_state["show_logs"] = True
+        if st.session_state.get("show_logs"):
+            st.dataframe(api_log_df(200),hide_index=True,use_container_width=True)
 
 with tabs[1]:
     q=st.text_input("품목명",placeholder="마늘쫑")
@@ -153,9 +164,22 @@ with tabs[2]:
     st.dataframe(saved,hide_index=True,use_container_width=True,height=650) if not saved.empty else st.info('저장 결과 없음')
 
 with tabs[3]:
-    cache=cached_keywords(); st.metric('3년 원자료 저장 품목',len(cache))
-    st.dataframe(cache,hide_index=True,use_container_width=True,height=300)
-    st.download_button('DB 백업 다운로드',backup_database_bytes(),file_name=f"MarketScout_v3_{date.today().isoformat()}.db",use_container_width=True)
+    st.subheader("DB 백업 및 복원")
+    if st.button("저장 품목 목록 불러오기", key="load_cache_list", use_container_width=True):
+        st.session_state["show_cache_list"] = True
+    if st.session_state.get("show_cache_list"):
+        cache=cached_keywords(); st.metric('3년 원자료 저장 품목',len(cache))
+        st.dataframe(cache.head(1000),hide_index=True,use_container_width=True,height=300)
+        if len(cache)>1000: st.caption(f"화면에는 최근 1,000개만 표시합니다. 전체 {len(cache):,}개")
+    else:
+        st.info("목록과 백업 파일은 필요할 때만 생성하므로 평소 화면이 빠르게 열립니다.")
+
+    if st.button("백업 파일 준비", key="prepare_backup", use_container_width=True):
+        with st.spinner("DB 백업 파일을 만드는 중입니다..."):
+            st.session_state["db_backup_bytes"] = backup_database_bytes()
+            st.session_state["db_backup_name"] = f"MarketScout_v3_{date.today().isoformat()}.db"
+    if st.session_state.get("db_backup_bytes"):
+        st.download_button('DB 백업 다운로드',st.session_state["db_backup_bytes"],file_name=st.session_state.get("db_backup_name","MarketScout_v3.db"),use_container_width=True)
     up=st.file_uploader('DB 복원',type=['db','sqlite','sqlite3'])
     if up and st.button('복원 실행',type='primary'):
         try: restore_database_bytes(up.getvalue());db_df_cached.clear();category_map_cached.clear();st.success('복원 완료');st.rerun()
