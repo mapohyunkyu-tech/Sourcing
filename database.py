@@ -294,6 +294,95 @@ def today_api_calls() -> int:
 
 
 
+def reset_keywords_for_refresh(keywords) -> dict:
+    """Delete cached raw data and analysis for selected keywords, then queue them again."""
+    cleaned = []
+    seen = set()
+    for value in keywords or []:
+        kw = str(value).strip()
+        if kw and kw not in seen:
+            seen.add(kw)
+            cleaned.append(kw)
+    if not cleaned:
+        return {"requested": 0, "cache_deleted": 0, "analysis_deleted": 0, "queued": 0}
+
+    ensure_bulk_schema()
+    placeholders = ",".join("?" for _ in cleaned)
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cache_deleted = con.execute(
+            f"DELETE FROM trend_cache WHERE keyword IN ({placeholders})", cleaned
+        ).rowcount or 0
+        analysis_deleted = con.execute(
+            f"DELETE FROM analysis_results WHERE search_keyword IN ({placeholders})", cleaned
+        ).rowcount or 0
+
+        sql = """INSERT INTO collection_queue(
+                    keyword, category, representative_name, status,
+                    attempts, last_error, updated_at
+                 ) VALUES(?,?,?,'pending',0,NULL,datetime('now','localtime'))
+                 ON CONFLICT(keyword) DO UPDATE SET
+                   status='pending', attempts=0, last_error=NULL,
+                   category=CASE WHEN excluded.category!='' THEN excluded.category ELSE collection_queue.category END,
+                   representative_name=CASE WHEN excluded.representative_name!='' THEN excluded.representative_name ELSE collection_queue.representative_name END,
+                   updated_at=datetime('now','localtime')"""
+        for kw in cleaned:
+            item = con.execute(
+                "SELECT category, representative_name FROM item_names WHERE search_name=? LIMIT 1",
+                (kw,),
+            ).fetchone()
+            category = item["category"] if item else ""
+            representative = item["representative_name"] if item else kw
+            con.execute(sql, (kw, category, representative))
+
+    return {
+        "requested": len(cleaned),
+        "cache_deleted": int(cache_deleted),
+        "analysis_deleted": int(analysis_deleted),
+        "queued": len(cleaned),
+    }
+
+
+def reset_categories_for_refresh(category_names, representative_only: bool = True) -> dict:
+    """Reset all active items in selected categories for fresh collection."""
+    cats = [str(x).strip() for x in (category_names or []) if str(x).strip()]
+    if not cats:
+        return {"requested": 0, "cache_deleted": 0, "analysis_deleted": 0, "queued": 0}
+
+    placeholders = ",".join("?" for _ in cats)
+    with connect(read_only=True) as con:
+        if representative_only:
+            rows = con.execute(
+                f"SELECT DISTINCT representative_name FROM item_names WHERE active=1 AND category IN ({placeholders}) ORDER BY representative_name",
+                cats,
+            ).fetchall()
+        else:
+            rows = con.execute(
+                f"SELECT DISTINCT search_name FROM item_names WHERE active=1 AND category IN ({placeholders}) ORDER BY search_name",
+                cats,
+            ).fetchall()
+    return reset_keywords_for_refresh([r[0] for r in rows])
+
+
+def reset_all_collection_data() -> dict:
+    """Delete all raw/analysis data and return the existing queue to pending."""
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cache_count = con.execute("SELECT COUNT(*) FROM trend_cache").fetchone()[0]
+        analysis_count = con.execute("SELECT COUNT(*) FROM analysis_results").fetchone()[0]
+        queue_count = con.execute("SELECT COUNT(*) FROM collection_queue").fetchone()[0]
+        con.execute("DELETE FROM trend_cache")
+        con.execute("DELETE FROM analysis_results")
+        con.execute(
+            "UPDATE collection_queue SET status='pending', attempts=0, last_error=NULL, updated_at=datetime('now','localtime')"
+        )
+    return {
+        "cache_deleted": int(cache_count),
+        "analysis_deleted": int(analysis_count),
+        "queued": int(queue_count),
+    }
+
 def initialize_database():
     ensure_schema()
     return True
