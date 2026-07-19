@@ -4,8 +4,10 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from database import add_item, categories, category_map, get_item_names, load_analysis, load_database_df, save_analysis, search_items
-from engine import ApiConfig, analyze, analyze_keyword, call_api, collect, completed_years, to_excel
+from database import (add_item, categories, category_map, get_item_names, load_analysis,
+    load_database_df, save_analysis, search_items, save_raw_series, load_raw_series,
+    cached_keywords, backup_database_bytes, restore_database_bytes)
+from engine import ApiConfig, NaverApiError, analyze, analyze_keyword, call_api, collect, completed_years, to_excel
 from settings_store import delete_credentials, load_settings, save_settings
 
 st.set_page_config(page_title="MarketScout 시즌 AI", page_icon="📈", layout="wide")
@@ -28,6 +30,24 @@ def config_now():
         return ApiConfig(settings["client_id"],settings["client_secret"],settings.get("auth_mode","developer"))
     return None
 config=config_now()
+
+def get_or_fetch_keyword(keyword: str, force: bool=False):
+    ys=completed_years(); start=f"{ys[0]}-01-01"; end=f"{ys[-1]}-12-31"
+    if not force:
+        cached=load_raw_series(keyword,start,end)
+        if cached is not None:
+            return pd.DataFrame({keyword:cached}), False
+    if config is None:
+        raise NaverApiError("API 키가 없고 저장된 데이터도 없습니다.")
+    raw=collect(config,[keyword],start,end)
+    if keyword not in raw.columns:
+        raise NaverApiError(f"{keyword} 데이터가 반환되지 않았습니다.")
+    save_raw_series(keyword,raw[keyword],start,end)
+    return raw[[keyword]], True
+if config is None:
+    st.warning("⚙️ 설정 탭에서 네이버 데이터랩 API 키를 저장해야 분석할 수 있습니다.")
+elif config.auth_mode != "developer":
+    st.warning("현재 인증 방식이 NAVER Developers가 아닙니다. Developers에서 발급한 키라면 설정 탭에서 인증 방식을 바꾸세요.")
 for k,v in {"quick_result":None,"raw":None,"results":None}.items():st.session_state.setdefault(k,v)
 
 def fd(v):
@@ -66,11 +86,21 @@ with tabs[0]:
         aliases=get_item_names(str(s["대표품목"])); st.caption("연결 품목명: "+", ".join(aliases[:40])+(" …" if len(aliases)>40 else ""))
         cached=load_analysis(str(s["검색명"]),date.today().year)
         c1,c2=st.columns(2)
-        if c1.button("최근 완료 3년 새로 분석",type="primary",disabled=config is None,use_container_width=True):
+        if c1.button("최근 완료 3년 새로 분석(API 1회)",type="primary",disabled=config is None,use_container_width=True):
             ys=completed_years()
             with st.spinner(f"{ys[0]}~{ys[-1]} 데이터 분석 중"):
-                raw=collect(config,[str(s['검색명'])],f"{ys[0]}-01-01",f"{ys[-1]}-12-31")
-                r=analyze_keyword(raw,str(s['검색명']),date.today().year);save_analysis(r);st.session_state.quick_result=r;st.session_state.raw=raw
+                try:
+                    raw,api_used=get_or_fetch_keyword(str(s['검색명']),force=True)
+                    r=analyze_keyword(raw,str(s['검색명']),date.today().year)
+                    r["data_source"]="API 새 조회" if api_used else "DB 캐시"
+                    save_analysis(r)
+                    st.session_state.quick_result=r
+                    st.session_state.raw=raw
+                except NaverApiError as e:
+                    st.error(f"네이버 데이터랩 연결 실패: {e}")
+                    st.info("⚙️ 설정 탭에서 인증 방식을 'NAVER Developers 데이터랩'으로 선택하고 연결 테스트를 먼저 눌러주세요.")
+                except Exception as e:
+                    st.error(f"분석 중 오류: {e}")
         if c2.button("저장 결과 보기",disabled=cached.empty,use_container_width=True):st.session_state.quick_result=cached.iloc[0].to_dict()
         r=st.session_state.quick_result
         if r and r.get("search_keyword")==str(s["검색명"]):
@@ -82,7 +112,28 @@ with tabs[1]:
     if st.button("월별 분석 실행",type="primary",disabled=config is None or not cats,use_container_width=True):
         items=[x for cat in cats for x in products[cat]];ys=completed_years();bar=st.progress(0)
         def prog(n,total,batch):bar.progress(n/total)
-        raw=collect(config,items,f"{ys[0]}-01-01",f"{ys[-1]}-12-31",prog);res=analyze(raw,{cat:products[cat] for cat in cats},year,month);st.session_state.results=res;st.session_state.raw=raw
+        try:
+            frames=[]; api_count=0
+            for i,item in enumerate(items,1):
+                bar.progress(i/max(1,len(items)))
+                cached_s=load_raw_series(item,f"{ys[0]}-01-01",f"{ys[-1]}-12-31")
+                if cached_s is not None:
+                    frames.append(cached_s.rename(item)); continue
+                if config is None: continue
+                one=collect(config,[item],f"{ys[0]}-01-01",f"{ys[-1]}-12-31")
+                if item in one.columns:
+                    save_raw_series(item,one[item],f"{ys[0]}-01-01",f"{ys[-1]}-12-31")
+                    frames.append(one[item].rename(item)); api_count+=1
+            raw=pd.concat(frames,axis=1).sort_index() if frames else pd.DataFrame()
+            res=analyze(raw,{cat:products[cat] for cat in cats},year,month) if not raw.empty else pd.DataFrame()
+            st.info(f"저장 데이터 우선 사용 · 이번 실행 API 호출 {api_count}회")
+            st.session_state.results=res
+            st.session_state.raw=raw
+        except NaverApiError as e:
+            st.error(f"네이버 데이터랩 연결 실패: {e}")
+            st.info("⚙️ 설정 탭에서 인증 방식을 'NAVER Developers 데이터랩'으로 선택하고 연결 테스트를 먼저 눌러주세요.")
+        except Exception as e:
+            st.error(f"월별 분석 중 오류: {e}")
     res=st.session_state.results
     if res is not None:
         if res.empty:st.info("해당 월 결과가 없습니다.")
@@ -97,7 +148,18 @@ with tabs[2]:
 with tabs[3]:
     st.success(f"검색 가능 품목명 {len(db_df):,}개 · 대표품목 {db_df['기준품목'].nunique():,}개")
     find=st.text_input("DB 검색");view=db_df[db_df["세부품목"].str.contains(find,case=False,na=False)] if find else db_df
-    st.dataframe(view,hide_index=True,use_container_width=True,height=650)
+    st.dataframe(view,hide_index=True,use_container_width=True,height=500)
+    st.divider(); st.subheader("💾 분석 DB 백업·복원")
+    cache_df=cached_keywords()
+    st.caption(f"3년 원자료 저장 품목: {len(cache_df):,}개 · 분석 결과: {len(load_analysis()):,}개")
+    if not cache_df.empty: st.dataframe(cache_df,hide_index=True,use_container_width=True,height=220)
+    st.download_button("DB 백업 다운로드",backup_database_bytes(),file_name=f"MarketScout_backup_{date.today().isoformat()}.db",mime="application/octet-stream",use_container_width=True)
+    uploaded_db=st.file_uploader("백업 DB 복원",type=["db","sqlite","sqlite3"])
+    if uploaded_db is not None and st.button("업로드한 DB로 복원",type="primary",use_container_width=True):
+        try:
+            restore_database_bytes(uploaded_db.getvalue()); cached_database_df.clear(); cached_category_map.clear(); st.success("복원 완료"); st.rerun()
+        except Exception as e: st.error(f"복원 실패: {e}")
+    st.warning("Streamlit Cloud 서버 저장공간은 재배포·컨테이너 교체 시 초기화될 수 있습니다. 중요한 분석 후에는 DB 백업을 내려받으세요.")
 with tabs[4]:
     modes={"developer":"NAVER Developers 데이터랩","hub":"NAVER API HUB","legacy_ncp":"NAVER Cloud 기존 방식"};mode=st.selectbox("인증 방식",list(modes),format_func=lambda x:modes[x],index=list(modes).index(settings.get("auth_mode","developer")) if settings.get("auth_mode","developer") in modes else 0)
     cid=st.text_input("Client ID",value=settings.get("client_id",""));secret=st.text_input("Client Secret",value=settings.get("client_secret",""),type="password")

@@ -9,7 +9,7 @@ APP_DIR = Path.home() / ".marketscout"
 SETTINGS_FILE = APP_DIR / "settings.json"
 
 DEFAULTS: Dict[str, Any] = {
-    "auth_mode": "hub",
+    "auth_mode": "developer",
     "client_id": "",
     "client_secret": "",
     "target_month": 8,

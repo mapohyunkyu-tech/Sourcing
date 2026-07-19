@@ -101,3 +101,71 @@ def load_analysis(keyword: Optional[str]=None,target_year: Optional[int]=None):
     return pd.DataFrame([json.loads(r[0]) for r in rows])
 
 ensure_schema()
+
+# ---------------- persistent trend cache / backup ----------------
+def save_raw_series(keyword: str, series: pd.Series, start_date: str, end_date: str):
+    import json
+    payload = {pd.Timestamp(k).date().isoformat(): float(v) for k, v in series.dropna().items()}
+    with connect() as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS trend_cache(
+            keyword TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+            series_json TEXT NOT NULL, updated_at TEXT NOT NULL
+        )''')
+        con.execute('''INSERT INTO trend_cache(keyword,start_date,end_date,series_json,updated_at)
+            VALUES(?,?,?,?,datetime('now','localtime'))
+            ON CONFLICT(keyword) DO UPDATE SET start_date=excluded.start_date,end_date=excluded.end_date,
+            series_json=excluded.series_json,updated_at=excluded.updated_at''',
+            (keyword,start_date,end_date,json.dumps(payload,ensure_ascii=False)))
+
+def load_raw_series(keyword: str, start_date: str | None=None, end_date: str | None=None):
+    import json
+    with connect() as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS trend_cache(
+            keyword TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+            series_json TEXT NOT NULL, updated_at TEXT NOT NULL
+        )''')
+        row=con.execute('SELECT start_date,end_date,series_json,updated_at FROM trend_cache WHERE keyword=?',(keyword,)).fetchone()
+    if not row: return None
+    if start_date and row['start_date'] > start_date: return None
+    if end_date and row['end_date'] < end_date: return None
+    data=json.loads(row['series_json'])
+    s=pd.Series(data,dtype=float,name=keyword); s.index=pd.to_datetime(s.index); s=s.sort_index()
+    return s
+
+def cached_keywords() -> pd.DataFrame:
+    with connect() as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS trend_cache(
+            keyword TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+            series_json TEXT NOT NULL, updated_at TEXT NOT NULL
+        )''')
+        return pd.read_sql_query('SELECT keyword AS 품목,start_date AS 시작일,end_date AS 종료일,updated_at AS 저장일시 FROM trend_cache ORDER BY updated_at DESC',con)
+
+def backup_database_bytes() -> bytes:
+    # SQLite online backup creates a consistent snapshot even while app is running.
+    import tempfile, os
+    fd,tmp=tempfile.mkstemp(suffix='.db'); os.close(fd)
+    try:
+        src=connect(); dst=sqlite3.connect(tmp)
+        try: src.backup(dst)
+        finally: dst.close(); src.close()
+        return Path(tmp).read_bytes()
+    finally:
+        try: Path(tmp).unlink()
+        except FileNotFoundError: pass
+
+def restore_database_bytes(data: bytes):
+    import tempfile, os
+    fd,tmp=tempfile.mkstemp(suffix='.db'); os.close(fd)
+    try:
+        Path(tmp).write_bytes(data)
+        test=sqlite3.connect(tmp)
+        try:
+            ok=test.execute('PRAGMA integrity_check').fetchone()[0]
+            if ok != 'ok': raise RuntimeError(f'DB 무결성 검사 실패: {ok}')
+        finally: test.close()
+        DB_PATH.parent.mkdir(parents=True,exist_ok=True)
+        Path(tmp).replace(DB_PATH)
+    finally:
+        try: Path(tmp).unlink()
+        except FileNotFoundError: pass
+    ensure_schema()

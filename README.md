@@ -1,10 +1,14 @@
-# MarketScout 시즌 AI
+# MarketScout 시즌 AI v2
 
-1. 폴더 압축을 풉니다.
-2. `run_windows.bat`를 실행합니다.
-3. 설정 탭에서 NAVER API 인증방식과 Client ID/Secret을 저장합니다.
-4. 품목 즉시판단에서 품목을 검색하고 최근 완료 3년 분석을 실행합니다.
+- 네이버 DataLab 3년 원자료를 SQLite에 품목별 저장
+- 같은 품목은 저장 데이터를 우선 사용하여 API 호출 절감
+- 분석 결과 영구 저장(동일 Streamlit 컨테이너 내)
+- DB 백업 다운로드 / 업로드 복원
+- Streamlit Cloud 재배포나 컨테이너 교체 전에는 DB 백업 권장
 
-마스터 CSV는 최초 실행 시 자동으로 SQLite DB에 적재됩니다.
+## 실행
+`streamlit run app.py`
 
-분석 결과: 등록 준비일, 진입일, 시즌 시작일, 연도별 피크일, 평균 예상 피크일, 피크구간, 후반 판매 가능기간, 종료일, 남은 판매일, 추천 행동.
+## API
+설정에서 `NAVER Developers 데이터랩`을 선택하고 Client ID / Secret을 저장합니다.
+월별 전체 분석은 아직 저장되지 않은 품목만 API를 호출하므로, 처음 대량 구축 시 일일 1000회 한도를 고려해 카테고리별로 나누어 실행하세요.
