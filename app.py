@@ -9,16 +9,27 @@ from database import (
     save_analysis, search_items, save_raw_series, load_raw_series, cached_keywords,
     backup_database_bytes, restore_database_bytes, enqueue_keywords, next_pending_keywords,
     mark_queue_completed, mark_queue_failed, queue_status_df, queue_counts, reset_failed_queue,
-    clear_pending_queue, log_api_call, api_log_df, today_api_calls
+    clear_pending_queue, log_api_call, api_log_df, today_api_calls,
+    sync_queue_with_cache, initialize_database
 )
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.2.0-sqlite-lock-fix"
+APP_VERSION = "3.3.0-no-rerun-ddl"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
-st.caption("5품목 묶음 수집 · 즉시 저장 · 이어받기 · 무한로딩 수정")
+st.caption("DB 초기화 1회 · 평상시 읽기 전용 · 5품목 묶음 수집 · 이어받기")
 settings = load_settings()
+
+@st.cache_resource(show_spinner=False)
+def init_once():
+    return initialize_database()
+
+try:
+    init_once()
+except Exception as e:
+    st.error(f"DB 초기화 실패: {e}")
+    st.stop()
 
 @st.cache_data(show_spinner=False)
 def db_df_cached(): return load_database_df()
