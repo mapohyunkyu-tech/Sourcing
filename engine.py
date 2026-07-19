@@ -198,3 +198,218 @@ def to_excel(results: pd.DataFrame, raw: pd.DataFrame) -> bytes:
         results.to_excel(w,index=False,sheet_name="카테고리_TOP")
         raw.to_excel(w,sheet_name="일별원자료")
     return bio.getvalue()
+
+# ------------------------------------------------------------------
+# Streamlit app compatibility / detailed single-keyword season model
+# ------------------------------------------------------------------
+def completed_years(today: date | None = None, count: int = 3) -> List[int]:
+    """Return the latest fully completed calendar years."""
+    today = today or date.today()
+    last = today.year - 1
+    return list(range(last - count + 1, last + 1))
+
+
+def _iso(v: date | datetime | pd.Timestamp | None) -> str | None:
+    if v is None:
+        return None
+    return pd.Timestamp(v).date().isoformat()
+
+
+def _safe_date(year: int, month: int, day: int) -> date:
+    # Handles leap-day averages safely.
+    while day > 28:
+        try:
+            return date(year, month, day)
+        except ValueError:
+            day -= 1
+    return date(year, month, day)
+
+
+def _project_doy(target_year: int, doy: int) -> date:
+    max_doy = 366 if pd.Timestamp(target_year, 12, 31).dayofyear == 366 else 365
+    return date(target_year, 1, 1) + timedelta(days=max(1, min(max_doy, int(doy))) - 1)
+
+
+def _season_profile_for_year(series: pd.Series, year: int) -> dict | None:
+    sy = series.loc[series.index.year == year].astype(float).sort_index()
+    if sy.empty:
+        return None
+    full_idx = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+    sy = sy.reindex(full_idx).fillna(0.0)
+    sm = _smooth(sy)
+    peak_value = float(sm.max())
+    if peak_value <= 0:
+        return None
+    peak_ts = pd.Timestamp(sm.idxmax())
+    baseline = float(sm.quantile(0.50))
+    start_threshold = max(peak_value * 0.20, baseline * 1.15)
+    end_threshold = max(peak_value * 0.18, baseline * 1.05)
+    peak_threshold = peak_value * 0.85
+
+    peak_pos = int(sm.index.get_loc(peak_ts))
+    left = peak_pos
+    while left > 0 and float(sm.iloc[left - 1]) >= start_threshold:
+        left -= 1
+    right = peak_pos
+    while right < len(sm) - 1 and float(sm.iloc[right + 1]) >= end_threshold:
+        right += 1
+
+    pleft = peak_pos
+    while pleft > 0 and float(sm.iloc[pleft - 1]) >= peak_threshold:
+        pleft -= 1
+    pright = peak_pos
+    while pright < len(sm) - 1 and float(sm.iloc[pright + 1]) >= peak_threshold:
+        pright += 1
+
+    return {
+        "year": year,
+        "peak_doy": peak_ts.dayofyear,
+        "peak_date": peak_ts.date(),
+        "start_doy": sm.index[left].dayofyear,
+        "end_doy": sm.index[right].dayofyear,
+        "peak_start_doy": sm.index[pleft].dayofyear,
+        "peak_end_doy": sm.index[pright].dayofyear,
+        "peak_value": peak_value,
+        "monthly": sm.groupby(sm.index.month).mean().reindex(range(1, 13), fill_value=0.0),
+    }
+
+
+def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = None, today: date | None = None) -> dict:
+    """Analyze one keyword and return the payload expected by app.py/database.py."""
+    today = today or date.today()
+    target_year = int(target_year or today.year)
+    if keyword not in raw.columns:
+        raise ValueError(f"원자료에 '{keyword}' 열이 없습니다.")
+
+    s = raw[keyword].copy()
+    s.index = pd.to_datetime(s.index)
+    candidate_years = sorted(set(int(y) for y in s.index.year))
+    profiles = [p for y in candidate_years if (p := _season_profile_for_year(s, y)) is not None]
+    profiles = profiles[-3:]
+    if len(profiles) < 2:
+        raise ValueError("시즌 계산에 필요한 유효 연도 데이터가 2개 미만입니다.")
+
+    monthly_df = pd.concat([p["monthly"] for p in profiles], axis=1)
+    monthly_avg = monthly_df.mean(axis=1)
+    peak_month_value = float(monthly_avg.max())
+    avg_month_value = float(monthly_avg.mean())
+    active_months = int((monthly_avg >= peak_month_value * 0.50).sum()) if peak_month_value > 0 else 12
+    cv = float(monthly_avg.std() / (avg_month_value + 1e-9))
+    peak_to_median = peak_month_value / (float(monthly_avg.median()) + 1e-9)
+    evergreen = active_months >= 10 and peak_to_median < 1.65 and cv < 0.35
+
+    peak_spread = float(np.std([p["peak_doy"] for p in profiles]))
+    consistency = max(0.0, min(100.0, 100.0 - peak_spread * 2.0))
+    seasonality = max(0.0, min(100.0, (peak_to_median - 1.0) * 40.0 + cv * 70.0 + (12 - active_months) * 5.0))
+    confidence = round(consistency * 0.55 + seasonality * 0.45, 1)
+
+    recent = _smooth(s).iloc[-30:]
+    if len(recent) >= 2 and float(recent.iloc[0]) > 0:
+        recent_change = round((float(recent.iloc[-1]) / float(recent.iloc[0]) - 1.0) * 100.0, 1)
+    else:
+        recent_change = 0.0
+
+    base = {
+        "search_keyword": keyword,
+        "target_year": target_year,
+        "analysis_years": ", ".join(str(p["year"]) for p in profiles),
+        "yearly_peak_dates": ", ".join(f"{p['year']} {p['peak_date'].strftime('%m/%d')}" for p in profiles),
+        "season_type_confidence": confidence,
+        "recent_30d_change": recent_change,
+        "last_analyzed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    if evergreen:
+        return {
+            **base,
+            "season_type_calculated": "사계절형",
+            "judgement": "상시 판매 가능",
+            "recommended_upload_date": None,
+            "entry_date": None,
+            "season_start_date": None,
+            "expected_peak_date": None,
+            "expected_peak_start_date": None,
+            "expected_peak_end_date": None,
+            "gentle_decline_start_date": None,
+            "expected_end_date": None,
+            "remaining_sales_days": 365,
+            "season_progress": 0,
+            "recommended_action": "상시 판매 · 최근 추세에 맞춰 재고 조절",
+        }
+
+    entry_doy = _circular_mean_doy([p["start_doy"] for p in profiles])
+    peak_doy = _circular_mean_doy([p["peak_doy"] for p in profiles])
+    peak_start_doy = _circular_mean_doy([p["peak_start_doy"] for p in profiles])
+    peak_end_doy = _circular_mean_doy([p["peak_end_doy"] for p in profiles])
+    end_doy = _circular_mean_doy([p["end_doy"] for p in profiles])
+
+    entry = _project_doy(target_year, entry_doy)
+    peak = _project_doy(target_year, peak_doy)
+    peak_start = _project_doy(target_year, peak_start_doy)
+    peak_end = _project_doy(target_year, peak_end_doy)
+    end = _project_doy(target_year, end_doy)
+
+    # Handle seasons crossing New Year.
+    if entry > peak:
+        entry = _project_doy(target_year - 1, entry_doy)
+    if peak_start < entry:
+        peak_start = _project_doy(target_year, peak_start_doy)
+    if peak_end < peak_start:
+        peak_end = _project_doy(target_year + 1, peak_end_doy)
+    if end < peak:
+        end = _project_doy(target_year + 1, end_doy)
+
+    upload = entry - timedelta(days=14)
+    season_start = entry
+    decline = peak_end + timedelta(days=1)
+    total_days = max(1, (end - entry).days + 1)
+    elapsed = min(max((today - entry).days, 0), total_days)
+    progress = round(elapsed / total_days * 100.0, 1)
+    remaining = max(0, (end - today).days + 1) if today >= entry else max(0, (end - entry).days + 1)
+    judgement, action, _ = _status(entry, peak, end, today)
+
+    return {
+        **base,
+        "season_type_calculated": "제철형",
+        "judgement": judgement,
+        "recommended_upload_date": _iso(upload),
+        "entry_date": _iso(entry),
+        "season_start_date": _iso(season_start),
+        "expected_peak_date": _iso(peak),
+        "expected_peak_start_date": _iso(peak_start),
+        "expected_peak_end_date": _iso(peak_end),
+        "gentle_decline_start_date": _iso(decline),
+        "expected_end_date": _iso(end),
+        "remaining_sales_days": int(remaining),
+        "season_progress": progress,
+        "recommended_action": action,
+    }
+
+
+# Override the earlier monthly analyzer with the payload shape used by app.py.
+def analyze(raw: pd.DataFrame, category_map: Dict[str, List[str]], target_year: int, target_month: int, today: date | None = None) -> pd.DataFrame:
+    today = today or date.today()
+    rows: List[dict] = []
+    for category, items in category_map.items():
+        for keyword in items:
+            if keyword == ANCHOR or keyword not in raw.columns:
+                continue
+            try:
+                r = analyze_keyword(raw, keyword, target_year=target_year, today=today)
+            except ValueError:
+                continue
+            if r["season_type_calculated"] == "사계절형":
+                # All-year items are relevant in every month.
+                include = True
+            else:
+                start = pd.to_datetime(r["entry_date"]).date()
+                end = pd.to_datetime(r["expected_end_date"]).date()
+                month_start = date(target_year, target_month, 1)
+                month_end = (date(target_year + 1, 1, 1) - timedelta(days=1)) if target_month == 12 else (date(target_year, target_month + 1, 1) - timedelta(days=1))
+                include = max(start, month_start) <= min(end, month_end)
+            if include:
+                rows.append({"카테고리": category, "품목": keyword, **r})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["season_type_confidence", "카테고리", "품목"], ascending=[False, True, True]).reset_index(drop=True)
