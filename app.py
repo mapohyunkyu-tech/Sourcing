@@ -14,7 +14,7 @@ from database import (
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.1.0-loading-fix"
+APP_VERSION = "3.2.0-sqlite-lock-fix"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
 st.caption("5품목 묶음 수집 · 즉시 저장 · 이어받기 · 무한로딩 수정")
@@ -70,9 +70,11 @@ with tabs[0]:
         enqueue_keywords(rows); st.success(f"대기열에 {len(rows):,}개 반영")
     counts=queue_counts(); m=st.columns(5)
     m[0].metric('전체',counts['total']);m[1].metric('완료',counts['completed']);m[2].metric('대기',counts['pending']);m[3].metric('실패',counts['failed']);m[4].metric('오늘 앱 호출',today_api_calls())
-    a,b=st.columns(2)
+    a,b,c=st.columns(3)
     if a.button("실패 품목 다시 대기",use_container_width=True): reset_failed_queue(); st.rerun()
-    if b.button("미완료 대기열 비우기",use_container_width=True): clear_pending_queue(); st.rerun()
+    if b.button("캐시와 대기열 동기화",use_container_width=True):
+        changed=sync_queue_with_cache(); st.success(f"완료 상태 {changed:,}개 동기화"); st.rerun()
+    if c.button("미완료 대기열 비우기",use_container_width=True): clear_pending_queue(); st.rerun()
 
     if st.button("▶ 이어받기 시작",type="primary",disabled=config is None or counts['pending']==0,use_container_width=True):
         ys,start,end=years_range(); progress=st.progress(0); status=st.empty(); done=0; stopped=False

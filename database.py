@@ -12,9 +12,11 @@ DB_PATH = DATA_DIR / "market_scout.db"
 MASTER_CSV = BASE_DIR / "item_master.csv"
 
 def connect():
-    con = sqlite3.connect(DB_PATH, timeout=15)
+    # Streamlit reruns can overlap briefly. A generous timeout prevents transient
+    # "database is locked" errors while another request is committing one item.
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("PRAGMA busy_timeout=30000")
     return con
 
 def ensure_schema():
@@ -204,12 +206,40 @@ def enqueue_keywords(rows):
           representative_name=excluded.representative_name,
           status=CASE WHEN collection_queue.status='completed' THEN 'completed' ELSE 'pending' END,
           updated_at=datetime('now','localtime')''', rows)
+    sync_queue_with_cache()
 
-def sync_queue_with_cache():
+def sync_queue_with_cache() -> int:
+    """Synchronize the queue with already cached keywords.
+
+    Called only after queue changes or by an explicit repair action. It is never
+    called from dashboard read functions, avoiding write locks on every rerun.
+    Returns the number of queue rows changed. Older/restored DBs without the
+    expected cache table are safely ignored instead of crashing the app.
+    """
     ensure_bulk_schema()
-    with connect() as con:
-        con.execute("""UPDATE collection_queue SET status='completed',last_error=NULL,
-          updated_at=datetime('now','localtime') WHERE keyword IN (SELECT keyword FROM trend_cache)""")
+    try:
+        with connect() as con:
+            table = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trend_cache'"
+            ).fetchone()
+            if not table:
+                return 0
+            columns = {r[1] for r in con.execute("PRAGMA table_info(trend_cache)").fetchall()}
+            if "keyword" not in columns:
+                return 0
+            cur = con.execute("""UPDATE collection_queue
+                SET status='completed', last_error=NULL,
+                    updated_at=datetime('now','localtime')
+                WHERE status!='completed'
+                  AND EXISTS (
+                    SELECT 1 FROM trend_cache t
+                    WHERE t.keyword=collection_queue.keyword
+                  )""")
+            return max(int(cur.rowcount or 0), 0)
+    except sqlite3.OperationalError:
+        # A simultaneous item commit may briefly own the write lock. The next
+        # explicit synchronization will catch up; cached data itself is safe.
+        return 0
 
 def reset_failed_queue():
     ensure_bulk_schema()
@@ -222,7 +252,8 @@ def clear_pending_queue():
         con.execute("DELETE FROM collection_queue WHERE status!='completed'")
 
 def next_pending_keywords(limit: int=5):
-    ensure_bulk_schema(); sync_queue_with_cache()
+    # Read-only: never run UPDATE during normal screen rendering/collection loops.
+    ensure_bulk_schema()
     with connect() as con:
         return pd.read_sql_query('''SELECT keyword,category,representative_name FROM collection_queue
           WHERE status='pending' ORDER BY rowid LIMIT ?''', con, params=[int(limit)])
@@ -238,14 +269,17 @@ def mark_queue_failed(keyword: str, error: str):
         con.execute("UPDATE collection_queue SET status='failed',attempts=attempts+1,last_error=?,updated_at=datetime('now','localtime') WHERE keyword=?",(str(error)[:1000],keyword))
 
 def queue_status_df():
-    ensure_bulk_schema(); sync_queue_with_cache()
+    # Read-only so opening a tab cannot lock the database.
+    ensure_bulk_schema()
     with connect() as con:
         return pd.read_sql_query('''SELECT keyword AS 품목,category AS 카테고리,representative_name AS 대표품목,
           status AS 상태,attempts AS 시도횟수,last_error AS 최근오류,updated_at AS 갱신일시
           FROM collection_queue ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, updated_at DESC''',con)
 
 def queue_counts():
-    ensure_bulk_schema(); sync_queue_with_cache()
+    # This function is called on every Streamlit rerun, therefore it must remain
+    # strictly read-only. Completed items are marked immediately after save.
+    ensure_bulk_schema()
     with connect() as con:
         rows=con.execute("SELECT status,COUNT(*) FROM collection_queue GROUP BY status").fetchall()
     d={'pending':0,'completed':0,'failed':0}
