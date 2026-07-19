@@ -10,6 +10,7 @@ DATA_DIR = Path.home() / ".marketscout"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "market_scout.db"
 MASTER_CSV = BASE_DIR / "item_master.csv"
+_SCHEMA_READY = False
 
 def connect(read_only: bool=False):
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -21,8 +22,16 @@ def connect(read_only: bool=False):
     con.execute("PRAGMA busy_timeout=5000")
     return con
 
-def ensure_schema():
+def ensure_schema(force: bool = False):
+    global _SCHEMA_READY
+    if _SCHEMA_READY and not force:
+        return
     with connect() as con:
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass
         con.executescript("""
         CREATE TABLE IF NOT EXISTS item_names(
           name_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +70,7 @@ def ensure_schema():
         );
         """)
     if MASTER_CSV.exists(): import_master_if_empty()
+    _SCHEMA_READY = True
 
 def _read_csv(path: Path) -> pd.DataFrame:
     for enc in ("utf-8-sig","cp949","utf-8"):
@@ -181,11 +191,13 @@ def restore_database_bytes(data: bytes):
     finally:
         try: Path(tmp).unlink()
         except FileNotFoundError: pass
-    ensure_schema()
+    ensure_schema(force=True)
 
 # ---------------- bulk collection resume / logs ----------------
 def ensure_bulk_schema():
-    ensure_schema()
+    # initialize_database() runs once at app startup. Avoid schema writes on every read.
+    if not _SCHEMA_READY:
+        ensure_schema()
 
 def enqueue_keywords(rows):
     ensure_bulk_schema()

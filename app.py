@@ -16,7 +16,7 @@ from database import (
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.5.0-refresh-manager"
+APP_VERSION = "3.6.0-no-lock-loading"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
 st.caption("오늘 등록·진입·피크·판매잔여일을 한눈에 · 대량수집 이어받기")
@@ -53,6 +53,7 @@ def analyze_saved(keyword: str):
     raw=pd.DataFrame({keyword:s}); r=analyze_keyword(raw,keyword,date.today().year); save_analysis(r); return r
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _dashboard_frame() -> pd.DataFrame:
     df = load_analysis(target_year=date.today().year)
     if df.empty:
@@ -89,6 +90,14 @@ def _dashboard_frame() -> pd.DataFrame:
     df["피크까지"] = df["expected_peak_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
     df["남은판매일"] = df["expected_end_date"].apply(lambda d: max(0,(d-today).days+1) if pd.notna(d) else None)
     return df
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _queue_summary_cached():
+    return queue_counts(), today_api_calls()
+
+def clear_runtime_caches():
+    _dashboard_frame.clear()
+    _queue_summary_cached.clear()
 
 def _fmt_date(v):
     return v.strftime("%m/%d") if pd.notna(v) else "-"
@@ -192,14 +201,14 @@ with tabs[1]:
             part=db_df[db_df['대분류']==cat]
             if only_rep: part=part.drop_duplicates('기준품목').assign(세부품목=lambda x:x['기준품목'])
             rows += [(str(r['세부품목']),str(r['대분류']),str(r['기준품목'])) for _,r in part.iterrows()]
-        enqueue_keywords(rows); st.success(f"대기열에 {len(rows):,}개 반영")
-    counts=queue_counts(); m=st.columns(5)
-    m[0].metric('전체',counts['total']);m[1].metric('완료',counts['completed']);m[2].metric('대기',counts['pending']);m[3].metric('실패',counts['failed']);m[4].metric('오늘 앱 호출',today_api_calls())
+        enqueue_keywords(rows); clear_runtime_caches(); st.success(f"대기열에 {len(rows):,}개 반영")
+    counts, today_calls = _queue_summary_cached(); m=st.columns(5)
+    m[0].metric('전체',counts['total']);m[1].metric('완료',counts['completed']);m[2].metric('대기',counts['pending']);m[3].metric('실패',counts['failed']);m[4].metric('오늘 앱 호출',today_calls)
     a,b,c=st.columns(3)
-    if a.button("실패 품목 다시 대기",use_container_width=True): reset_failed_queue(); st.rerun()
+    if a.button("실패 품목 다시 대기",use_container_width=True): reset_failed_queue(); clear_runtime_caches(); st.rerun()
     if b.button("캐시와 대기열 동기화",use_container_width=True):
-        changed=sync_queue_with_cache(); st.success(f"완료 상태 {changed:,}개 동기화"); st.rerun()
-    if c.button("미완료 대기열 비우기",use_container_width=True): clear_pending_queue(); st.rerun()
+        changed=sync_queue_with_cache(); clear_runtime_caches(); st.success(f"완료 상태 {changed:,}개 동기화"); st.rerun()
+    if c.button("미완료 대기열 비우기",use_container_width=True): clear_pending_queue(); clear_runtime_caches(); st.rerun()
 
     with st.expander("🔄 새 데이터로 다시 받기", expanded=False):
         st.warning("재수집을 선택하면 해당 품목의 기존 3년 원자료와 분석 결과를 지우고 대기 상태로 돌립니다.")
@@ -219,7 +228,7 @@ with tabs[1]:
             st.caption("재수집 대상: "+", ".join(parsed_refresh[:20])+(f" 외 {len(parsed_refresh)-20}개" if len(parsed_refresh)>20 else ""))
         if st.button("선택 품목을 새로 받기", disabled=not parsed_refresh, use_container_width=True):
             try:
-                result=reset_keywords_for_refresh(parsed_refresh)
+                result=reset_keywords_for_refresh(parsed_refresh); clear_runtime_caches()
                 st.success(f"{result['queued']:,}개를 재수집 대기로 변경했습니다. 기존 원자료 {result['cache_deleted']:,}개, 분석 {result['analysis_deleted']:,}개 삭제")
                 st.session_state["refresh_keywords_text"]=""
                 st.rerun()
@@ -232,7 +241,7 @@ with tabs[1]:
         refresh_rep_only=st.checkbox("대표품목만 다시 받기", value=True, key="refresh_rep_only")
         if st.button("선택 카테고리를 새로 받기", disabled=not refresh_cats, use_container_width=True):
             try:
-                result=reset_categories_for_refresh(refresh_cats, refresh_rep_only)
+                result=reset_categories_for_refresh(refresh_cats, refresh_rep_only); clear_runtime_caches()
                 st.success(f"{result['queued']:,}개를 재수집 대기로 변경했습니다. 기존 원자료 {result['cache_deleted']:,}개, 분석 {result['analysis_deleted']:,}개 삭제")
                 st.rerun()
             except Exception as e:
@@ -261,7 +270,7 @@ with tabs[1]:
                 use_container_width=True
             ):
                 try:
-                    result=reset_all_collection_data()
+                    result=reset_all_collection_data(); clear_runtime_caches()
                     st.session_state.pop("refresh_backup_bytes",None)
                     st.success(f"전체 초기화 완료: 원자료 {result['cache_deleted']:,}개, 분석 {result['analysis_deleted']:,}개 삭제 · 대기열 {result['queued']:,}개 재수집 대기")
                     st.rerun()
@@ -301,6 +310,7 @@ with tabs[1]:
                 log_api_call(keywords,'error',str(e))
                 for kw in keywords: mark_queue_failed(kw,str(e))
                 st.error(f"수집 중 오류: {e}"); stopped=True; break
+        clear_runtime_caches()
         if not stopped: st.success(f"이번 실행 완료: 신규 저장 {done}개")
         st.caption("페이지를 새로고침하면 최신 진행 현황이 표시됩니다.")
 
@@ -376,7 +386,7 @@ with tabs[4]:
         st.download_button('DB 백업 다운로드',st.session_state["db_backup_bytes"],file_name=st.session_state.get("db_backup_name","MarketScout_v3.db"),use_container_width=True)
     up=st.file_uploader('DB 복원',type=['db','sqlite','sqlite3'])
     if up and st.button('복원 실행',type='primary'):
-        try: restore_database_bytes(up.getvalue());db_df_cached.clear();category_map_cached.clear();st.success('복원 완료');st.rerun()
+        try: restore_database_bytes(up.getvalue());db_df_cached.clear();category_map_cached.clear();clear_runtime_caches();st.success('복원 완료');st.rerun()
         except Exception as e: st.error(str(e))
     st.warning('Streamlit Cloud 재배포 시 로컬 DB가 초기화될 수 있으니 수집 후 백업하세요.')
 
