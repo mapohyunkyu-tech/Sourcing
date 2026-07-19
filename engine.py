@@ -20,7 +20,7 @@ ANCHOR = "사과"
 class ApiConfig:
     client_id: str
     client_secret: str
-    auth_mode: str = "hub"
+    auth_mode: str = "developer"
 
     @property
     def url(self) -> str:
@@ -63,7 +63,9 @@ def call_api(config: ApiConfig, keywords: List[str], start_date: str, end_date: 
                         "Client ID·Secret 오타, 키 발급처와 인증 방식 불일치, 폐기·재발급된 키를 확인하세요. "
                         "Streamlit Cloud Secrets에 예전 키가 있으면 설정 탭에 저장한 키보다 우선 적용될 수 있으므로 Secrets도 확인하세요."
                     )
-            if r.status_code in (429, 500, 502, 503, 504):
+            if r.status_code == 429:
+                raise NaverApiError(f"HTTP 429: {detail}")
+            if r.status_code in (500, 502, 503, 504):
                 last = f"HTTP {r.status_code}: {detail}"
                 time.sleep(1.2 * (attempt + 1)); continue
             raise NaverApiError(f"NAVER API 오류 {r.status_code}: {detail}")

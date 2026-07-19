@@ -169,3 +169,102 @@ def restore_database_bytes(data: bytes):
         try: Path(tmp).unlink()
         except FileNotFoundError: pass
     ensure_schema()
+
+# ---------------- bulk collection resume / logs ----------------
+def ensure_bulk_schema():
+    with connect() as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS collection_queue(
+          keyword TEXT PRIMARY KEY,
+          category TEXT,
+          representative_name TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_status ON collection_queue(status);
+        CREATE TABLE IF NOT EXISTS api_call_log(
+          log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          called_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+          keyword_count INTEGER NOT NULL,
+          keywords TEXT NOT NULL,
+          result TEXT NOT NULL,
+          detail TEXT
+        );
+        ''')
+
+def enqueue_keywords(rows):
+    ensure_bulk_schema()
+    with connect() as con:
+        con.executemany('''INSERT INTO collection_queue(keyword,category,representative_name,status,updated_at)
+          VALUES(?,?,?,'pending',datetime('now','localtime'))
+          ON CONFLICT(keyword) DO UPDATE SET category=excluded.category,
+          representative_name=excluded.representative_name,
+          status=CASE WHEN collection_queue.status='completed' THEN 'completed' ELSE 'pending' END,
+          updated_at=datetime('now','localtime')''', rows)
+
+def sync_queue_with_cache():
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("""UPDATE collection_queue SET status='completed',last_error=NULL,
+          updated_at=datetime('now','localtime') WHERE keyword IN (SELECT keyword FROM trend_cache)""")
+
+def reset_failed_queue():
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("UPDATE collection_queue SET status='pending',last_error=NULL,updated_at=datetime('now','localtime') WHERE status='failed'")
+
+def clear_pending_queue():
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("DELETE FROM collection_queue WHERE status!='completed'")
+
+def next_pending_keywords(limit: int=5):
+    ensure_bulk_schema(); sync_queue_with_cache()
+    with connect() as con:
+        return pd.read_sql_query('''SELECT keyword,category,representative_name FROM collection_queue
+          WHERE status='pending' ORDER BY rowid LIMIT ?''', con, params=[int(limit)])
+
+def mark_queue_completed(keyword: str):
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("UPDATE collection_queue SET status='completed',last_error=NULL,updated_at=datetime('now','localtime') WHERE keyword=?",(keyword,))
+
+def mark_queue_failed(keyword: str, error: str):
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute("UPDATE collection_queue SET status='failed',attempts=attempts+1,last_error=?,updated_at=datetime('now','localtime') WHERE keyword=?",(str(error)[:1000],keyword))
+
+def queue_status_df():
+    ensure_bulk_schema(); sync_queue_with_cache()
+    with connect() as con:
+        return pd.read_sql_query('''SELECT keyword AS 품목,category AS 카테고리,representative_name AS 대표품목,
+          status AS 상태,attempts AS 시도횟수,last_error AS 최근오류,updated_at AS 갱신일시
+          FROM collection_queue ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, updated_at DESC''',con)
+
+def queue_counts():
+    ensure_bulk_schema(); sync_queue_with_cache()
+    with connect() as con:
+        rows=con.execute("SELECT status,COUNT(*) FROM collection_queue GROUP BY status").fetchall()
+    d={'pending':0,'completed':0,'failed':0}
+    d.update({r[0]:r[1] for r in rows}); d['total']=sum(d.values()); return d
+
+def log_api_call(keywords, result: str, detail: str=''):
+    ensure_bulk_schema()
+    with connect() as con:
+        con.execute('INSERT INTO api_call_log(keyword_count,keywords,result,detail) VALUES(?,?,?,?)',
+                    (len(keywords),', '.join(keywords),result,str(detail)[:1500]))
+
+def api_log_df(limit: int=200):
+    ensure_bulk_schema()
+    with connect() as con:
+        return pd.read_sql_query('''SELECT called_at AS 호출일시,keyword_count AS 품목수,keywords AS 품목,result AS 결과,detail AS 상세
+          FROM api_call_log ORDER BY log_id DESC LIMIT ?''',con,params=[int(limit)])
+
+def today_api_calls() -> int:
+    ensure_bulk_schema()
+    with connect() as con:
+        return int(con.execute("SELECT COUNT(*) FROM api_call_log WHERE date(called_at)=date('now','localtime')").fetchone()[0])
+
+ensure_bulk_schema()
