@@ -7,7 +7,7 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "market_scout.db"
-MASTER_CSV = BASE_DIR / "대한민국_농수산물_공식산지시장명반영_Master_v5.csv"
+MASTER_CSV = BASE_DIR / "item_master.csv"
 
 def connect():
     con = sqlite3.connect(DB_PATH)
