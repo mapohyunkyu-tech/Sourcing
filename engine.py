@@ -310,6 +310,18 @@ def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = N
         recent_change = round((float(recent.iloc[-1]) / float(recent.iloc[0]) - 1.0) * 100.0, 1)
     else:
         recent_change = 0.0
+    # 최근 상승 조짐과 가속도. 쿠팡 경쟁 데이터는 사용하지 않습니다.
+    if len(recent) >= 14:
+        first7 = float(recent.iloc[:7].mean())
+        mid7 = float(recent.iloc[-14:-7].mean())
+        last7 = float(recent.iloc[-7:].mean())
+        slope_prev = mid7 - first7
+        slope_now = last7 - mid7
+        acceleration = round(slope_now - slope_prev, 3)
+        rise_signal_score = round(max(0.0, min(100.0, 50.0 + recent_change * 0.8 + acceleration * 3.0)), 1)
+    else:
+        acceleration = 0.0
+        rise_signal_score = 50.0
 
     base = {
         "search_keyword": keyword,
@@ -318,6 +330,8 @@ def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = N
         "yearly_peak_dates": ", ".join(f"{p['year']} {p['peak_date'].strftime('%m/%d')}" for p in profiles),
         "season_type_confidence": confidence,
         "recent_30d_change": recent_change,
+        "recent_acceleration": acceleration,
+        "rise_signal_score": rise_signal_score,
         "last_analyzed_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -326,7 +340,10 @@ def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = N
             **base,
             "season_type_calculated": "사계절형",
             "judgement": "상시 판매 가능",
+            "exploration_start_date": None,
+            "photo_prepare_date": None,
             "recommended_upload_date": None,
+            "ad_start_date": None,
             "entry_date": None,
             "season_start_date": None,
             "expected_peak_date": None,
@@ -361,7 +378,10 @@ def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = N
     if end < peak:
         end = _project_doy(target_year + 1, end_doy)
 
+    explore = entry - timedelta(days=28)
+    photo_prepare = entry - timedelta(days=21)
     upload = entry - timedelta(days=14)
+    ad_start = entry - timedelta(days=3)
     season_start = entry
     decline = peak_end + timedelta(days=1)
     total_days = max(1, (end - entry).days + 1)
@@ -374,7 +394,10 @@ def analyze_keyword(raw: pd.DataFrame, keyword: str, target_year: int | None = N
         **base,
         "season_type_calculated": "제철형",
         "judgement": judgement,
+        "exploration_start_date": _iso(explore),
+        "photo_prepare_date": _iso(photo_prepare),
         "recommended_upload_date": _iso(upload),
+        "ad_start_date": _iso(ad_start),
         "entry_date": _iso(entry),
         "season_start_date": _iso(season_start),
         "expected_peak_date": _iso(peak),

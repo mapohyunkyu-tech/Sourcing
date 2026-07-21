@@ -56,6 +56,12 @@ def ensure_schema(force: bool = False):
           substitute_photo_allowed TEXT DEFAULT '조건부 가능',
           substitute_photo_notes TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS season_signals(
+          search_keyword TEXT NOT NULL, target_year INTEGER NOT NULL,
+          signal_type TEXT NOT NULL, signal_date TEXT NOT NULL,
+          source_note TEXT DEFAULT '', updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+          PRIMARY KEY(search_keyword,target_year)
+        );
         CREATE TABLE IF NOT EXISTS analysis_results(
           search_keyword TEXT NOT NULL, target_year INTEGER NOT NULL,
           payload_json TEXT NOT NULL, last_analyzed_at TEXT,
@@ -365,6 +371,76 @@ def update_default_master_assets() -> dict:
         "csv_written": csv_written,
         "default_db_written": db_written,
     }
+
+def save_season_signal(search_keyword: str, target_year: int, signal_type: str, signal_date, source_note: str = ""):
+    ensure_schema()
+    d = pd.Timestamp(signal_date).date().isoformat()
+    with connect() as con:
+        con.execute("""INSERT INTO season_signals(search_keyword,target_year,signal_type,signal_date,source_note,updated_at)
+          VALUES(?,?,?,?,?,datetime('now','localtime'))
+          ON CONFLICT(search_keyword,target_year) DO UPDATE SET signal_type=excluded.signal_type,signal_date=excluded.signal_date,source_note=excluded.source_note,updated_at=excluded.updated_at""",
+          (search_keyword.strip(), int(target_year), signal_type.strip(), d, source_note.strip()))
+
+def delete_season_signal(search_keyword: str, target_year: int):
+    with connect() as con:
+        con.execute("DELETE FROM season_signals WHERE search_keyword=? AND target_year=?",(search_keyword.strip(),int(target_year)))
+
+def load_season_signals(target_year: Optional[int] = None) -> pd.DataFrame:
+    ensure_schema()
+    sql="SELECT search_keyword,target_year,signal_type,signal_date,source_note,updated_at FROM season_signals"
+    params=[]
+    if target_year is not None:
+        sql += " WHERE target_year=?"; params=[int(target_year)]
+    sql += " ORDER BY signal_date DESC,search_keyword"
+    with connect(read_only=True) as con:
+        return pd.read_sql_query(sql,con,params=params)
+
+def apply_season_signals(df: pd.DataFrame, target_year: int) -> pd.DataFrame:
+    """출하 신호를 이용해 3년 평균 일정을 최대 ±21일 보정하고 선점점수/오늘행동을 계산합니다."""
+    if df is None or df.empty: return df
+    out=df.copy(); signals=load_season_signals(target_year)
+    signal_map={str(r.search_keyword):r for r in signals.itertuples()} if not signals.empty else {}
+    date_cols=["exploration_start_date","photo_prepare_date","recommended_upload_date","ad_start_date","entry_date","season_start_date","expected_peak_start_date","expected_peak_date","expected_peak_end_date","gentle_decline_start_date","expected_end_date"]
+    offsets=[]; types=[]; dates=[]; notes=[]
+    expected_before={"첫 수확":14,"첫 출하":7,"본격 출하":0,"공판장 반입":3}
+    for idx,r in out.iterrows():
+        sig=signal_map.get(str(r.get("search_keyword",""))); offset=0
+        if sig is not None and r.get("entry_date"):
+            entry=pd.to_datetime(r.get("entry_date"),errors="coerce")
+            actual=pd.to_datetime(sig.signal_date,errors="coerce")
+            if pd.notna(entry) and pd.notna(actual):
+                expected=entry-pd.Timedelta(days=expected_before.get(sig.signal_type,0))
+                offset=max(-21,min(21,int((actual-expected).days)))
+                for c in date_cols:
+                    if c in out.columns and pd.notna(r.get(c)):
+                        d=pd.to_datetime(r.get(c),errors="coerce")
+                        if pd.notna(d): out.at[idx,c]=(d+pd.Timedelta(days=offset)).date().isoformat()
+        offsets.append(offset); types.append(getattr(sig,"signal_type","") if sig else ""); dates.append(getattr(sig,"signal_date","") if sig else ""); notes.append(getattr(sig,"source_note","") if sig else "")
+    out["year_adjust_days"]=offsets; out["season_signal_type"]=types; out["season_signal_date"]=dates; out["season_signal_note"]=notes
+    today=pd.Timestamp.today().date()
+    actions=[]; scores=[]
+    for _,r in out.iterrows():
+        def d(k):
+            x=pd.to_datetime(r.get(k),errors="coerce"); return x.date() if pd.notna(x) else None
+        exp,photo,upload,ad,entry,end=d("exploration_start_date"),d("photo_prepare_date"),d("recommended_upload_date"),d("ad_start_date"),d("entry_date"),d("expected_end_date")
+        if r.get("season_type_calculated")=="사계절형": action="상시 운영"
+        elif exp and today < exp: action="아직 대기"
+        elif photo and today < photo: action="공급처 탐색"
+        elif upload and today < upload: action="사진·상세페이지 준비"
+        elif ad and today < ad: action="오늘 선등록"
+        elif entry and today < entry: action="광고·가격 준비"
+        elif end and today <= end: action="판매 운영"
+        else: action="시즌 종료"
+        actions.append(action)
+        rise=float(r.get("rise_signal_score") or 50); repeat=float(r.get("season_type_confidence") or 0)
+        proximity=50.0
+        if entry:
+            days=(entry-today).days; proximity=max(0,min(100,100-abs(days-21)*2.5))
+        signal=100.0 if r.get("season_signal_date") else 0.0
+        accel=max(0,min(100,50+float(r.get("recent_acceleration") or 0)*4))
+        scores.append(round(rise*.30+repeat*.25+proximity*.20+signal*.15+accel*.10,1))
+    out["today_action"]=actions; out["preemption_score"]=scores
+    return out
 
 def save_analysis(result: dict, *_args):
     import json

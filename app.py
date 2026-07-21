@@ -11,15 +11,16 @@ from database import (
     mark_queue_completed, mark_queue_failed, queue_status_df, queue_counts, reset_failed_queue,
     clear_pending_queue, log_api_call, api_log_df, today_api_calls,
     sync_queue_with_cache, initialize_database, reset_keywords_for_refresh,
-    reset_categories_for_refresh, reset_all_collection_data, update_default_master_assets
+    reset_categories_for_refresh, reset_all_collection_data, update_default_master_assets,
+    save_season_signal, delete_season_signal, load_season_signals, apply_season_signals
 )
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.8.0-master-merge-photo-guide"
+APP_VERSION = "3.10.0-preemption-timeline"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
-st.caption("오늘 등록·진입·피크·판매잔여일을 한눈에 · 대량수집 이어받기")
+st.caption("공급처 탐색·사진 준비·선등록·광고 시작·피크를 한눈에 · 쿠팡 경쟁도 미사용")
 settings = load_settings()
 
 @st.cache_resource(show_spinner=False)
@@ -58,12 +59,13 @@ def _dashboard_frame() -> pd.DataFrame:
     df = load_analysis(target_year=date.today().year)
     if df.empty:
         return df
+    df = apply_season_signals(df, date.today().year)
     names = db_df[["대분류", "기준품목", "세부품목"]].drop_duplicates("세부품목")
     df = df.merge(names, how="left", left_on="search_keyword", right_on="세부품목")
     df["카테고리"] = df["대분류"].fillna("미분류")
     df["대표품목"] = df["기준품목"].fillna(df["search_keyword"])
     date_cols = [
-        "recommended_upload_date", "entry_date", "season_start_date",
+        "exploration_start_date", "photo_prepare_date", "recommended_upload_date", "ad_start_date", "entry_date", "season_start_date",
         "expected_peak_start_date", "expected_peak_date",
         "expected_peak_end_date", "gentle_decline_start_date", "expected_end_date"
     ]
@@ -85,7 +87,10 @@ def _dashboard_frame() -> pd.DataFrame:
         if today <= end: return "판매 후반"
         return "시즌 종료"
     df["단계"] = df.apply(stage, axis=1)
+    df["탐색까지"] = df["exploration_start_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
+    df["사진까지"] = df["photo_prepare_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
     df["등록까지"] = df["recommended_upload_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
+    df["광고까지"] = df["ad_start_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
     df["진입까지"] = df["entry_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
     df["피크까지"] = df["expected_peak_date"].apply(lambda d: (d-today).days if pd.notna(d) else None)
     df["남은판매일"] = df["expected_end_date"].apply(lambda d: max(0,(d-today).days+1) if pd.notna(d) else None)
@@ -108,13 +113,13 @@ def _display_table(df: pd.DataFrame, columns: list[str], height: int = 330):
         return
     view=df[columns].copy()
     rename={
-        "search_keyword":"품목", "recommended_upload_date":"등록시작", "entry_date":"진입일",
+        "search_keyword":"품목", "exploration_start_date":"탐색시작", "photo_prepare_date":"사진준비", "recommended_upload_date":"선등록", "ad_start_date":"광고시작", "entry_date":"진입일",
         "expected_peak_start_date":"피크시작", "expected_peak_date":"피크",
         "expected_peak_end_date":"피크종료", "expected_end_date":"판매종료",
         "season_type_confidence":"신뢰도", "judgement":"현재판단"
     }
     view=view.rename(columns=rename)
-    for c in ["등록시작","진입일","피크시작","피크","피크종료","판매종료"]:
+    for c in ["탐색시작","사진준비","선등록","광고시작","진입일","피크시작","피크","피크종료","판매종료"]:
         if c in view.columns: view[c]=view[c].apply(_fmt_date)
     st.dataframe(view, hide_index=True, use_container_width=True, height=height)
 
@@ -179,11 +184,11 @@ def result_card(r):
     c[2].metric('신뢰도',f"{float(r.get('season_type_confidence') or 0):.0f}점")
     c[3].metric('남은 판매일',f"{int(r.get('remaining_sales_days') or 0)}일")
     st.success(r.get('recommended_action','-'))
-    st.json({k:r.get(k) for k in ['recommended_upload_date','entry_date','season_start_date','expected_peak_start_date','expected_peak_date','expected_peak_end_date','expected_end_date','analysis_years']})
+    st.json({k:r.get(k) for k in ['exploration_start_date','photo_prepare_date','recommended_upload_date','ad_start_date','entry_date','expected_peak_start_date','expected_peak_date','expected_peak_end_date','expected_end_date','analysis_years']})
 
 if config is None: st.warning("⚙️ 설정에서 API 키를 저장하세요. 저장된 품목 조회는 가능합니다.")
 
-tabs=st.tabs(["📊 오늘 대시보드","🚚 대량 이어받기","🔍 품목 검색","🏠 저장 결과","🗂 DB 백업","⚙️ 설정"])
+tabs=st.tabs(["📊 오늘 대시보드","🌱 출하 신호","🚚 대량 이어받기","🔍 품목 검색","🏠 저장 결과","🗂 DB 백업","⚙️ 설정"])
 
 with tabs[0]:
     st.subheader("오늘의 판매 행동 대시보드")
@@ -212,6 +217,11 @@ with tabs[0]:
         m[3].metric("지금 준비 중",f"{len(preparing):,}개")
         m[4].metric("30일 내 준비",f"{len(next30):,}개")
         m[5].metric("사계절형",f"{len(evergreen):,}개")
+
+        st.markdown("### ✅ 오늘 해야 할 일")
+        action_order=["공급처 탐색","사진·상세페이지 준비","오늘 선등록","광고·가격 준비","판매 운영","아직 대기"]
+        action_view=view[view["today_action"].isin(action_order)].sort_values(["preemption_score"],ascending=False)
+        _display_table(action_view,["카테고리","search_keyword","today_action","preemption_score","year_adjust_days","exploration_start_date","photo_prepare_date","recommended_upload_date","ad_start_date","expected_peak_start_date","expected_peak_end_date"],420)
 
         st.markdown("#### 숫자 바로 아래 품목 요약")
         c1,c2=st.columns(2)
@@ -258,10 +268,31 @@ with tabs[0]:
 
         with st.expander("전체 시즌 일정 보기",expanded=False):
             allv=view[view["season_type_calculated"]=="제철형"].sort_values(["recommended_upload_date","entry_date"])
-            _display_table(allv,["카테고리","search_keyword","단계","등록까지","진입까지","피크까지","남은판매일","recommended_upload_date","entry_date","expected_peak_start_date","expected_peak_date","expected_end_date"],600)
+            _display_table(allv,["카테고리","search_keyword","today_action","preemption_score","year_adjust_days","탐색까지","사진까지","등록까지","광고까지","진입까지","exploration_start_date","photo_prepare_date","recommended_upload_date","ad_start_date","entry_date","expected_peak_start_date","expected_peak_date","expected_peak_end_date","expected_end_date"],600)
+
 
 
 with tabs[1]:
+    st.subheader("올해 첫 수확·출하 신호")
+    st.caption("확인한 출하 날짜를 저장하면 3년 평균 일정 전체를 최대 ±21일 보정합니다. 쿠팡 경쟁도는 계산하지 않습니다.")
+    c1,c2=st.columns(2)
+    signal_keyword=c1.selectbox("품목", sorted(db_df["세부품목"].dropna().astype(str).unique().tolist()), key="signal_keyword")
+    signal_type=c2.selectbox("신호 종류",["첫 수확","첫 출하","본격 출하","공판장 반입"],key="signal_type")
+    c3,c4=st.columns(2)
+    signal_date=c3.date_input("확인 날짜",value=date.today(),key="signal_date")
+    signal_note=c4.text_input("근거 메모",placeholder="예: 산지 농가 통화, 지역농협 첫 출하 기사",key="signal_note")
+    a,b=st.columns(2)
+    if a.button("출하 신호 저장",type="primary",use_container_width=True):
+        save_season_signal(signal_keyword,date.today().year,signal_type,signal_date,signal_note); clear_runtime_caches(); st.success("저장했습니다. 대시보드 일정에 즉시 반영됩니다."); st.rerun()
+    if b.button("선택 품목 신호 삭제",use_container_width=True):
+        delete_season_signal(signal_keyword,date.today().year); clear_runtime_caches(); st.success("삭제했습니다."); st.rerun()
+    sigdf=load_season_signals(date.today().year)
+    if sigdf.empty: st.info("저장된 올해 출하 신호가 없습니다.")
+    else:
+        sigdf=sigdf.rename(columns={"search_keyword":"품목","signal_type":"신호","signal_date":"확인일","source_note":"근거","updated_at":"수정일"})
+        st.dataframe(sigdf[["품목","신호","확인일","근거","수정일"]],hide_index=True,use_container_width=True)
+
+with tabs[2]:
     st.subheader("대량 수집 관리자")
     st.info("한 번 실행할 분량만 처리하고 종료합니다. 자동 무한 반복하지 않습니다.")
     selected=st.multiselect("수집할 카테고리",list(products),default=[])
@@ -406,7 +437,7 @@ with tabs[1]:
         if st.session_state.get("show_logs"):
             st.dataframe(api_log_df(200),hide_index=True,use_container_width=True)
 
-with tabs[2]:
+with tabs[3]:
     q=st.text_input("품목명",placeholder="마늘쫑")
     matches=search_items(q) if q.strip() else pd.DataFrame()
     if q.strip() and matches.empty:
@@ -454,11 +485,11 @@ with tabs[2]:
         r=st.session_state.get('one_result')
         if r: result_card(r)
 
-with tabs[3]:
+with tabs[4]:
     saved=load_analysis(target_year=date.today().year)
     st.dataframe(saved,hide_index=True,use_container_width=True,height=650) if not saved.empty else st.info('저장 결과 없음')
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("DB 백업 및 복원")
     if st.button("저장 품목 목록 불러오기", key="load_cache_list", use_container_width=True):
         st.session_state["show_cache_list"] = True
@@ -513,7 +544,7 @@ with tabs[4]:
             use_container_width=True, key="download_updated_default_db"
         )
 
-with tabs[5]:
+with tabs[6]:
     modes={'developer':'NAVER Developers 데이터랩','hub':'NAVER API HUB','legacy_ncp':'NAVER Cloud 기존 방식'}
     mode=st.selectbox('인증 방식',list(modes),format_func=lambda x:modes[x],index=list(modes).index(settings.get('auth_mode','developer')) if settings.get('auth_mode','developer') in modes else 0)
     cid=st.text_input('Client ID',value=settings.get('client_id',''));sec=st.text_input('Client Secret',value=settings.get('client_secret',''),type='password')
