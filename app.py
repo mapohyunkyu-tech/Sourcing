@@ -16,7 +16,7 @@ from database import (
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.7.0-dashboard-items-confidence"
+APP_VERSION = "3.7.1-naver-network-fallback"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
 st.caption("오늘 등록·진입·피크·판매잔여일을 한눈에 · 대량수집 이어받기")
@@ -470,7 +470,10 @@ with tabs[5]:
     c=st.columns(3)
     if c[0].button('저장',type='primary',use_container_width=True): settings.update({'auth_mode':mode,'client_id':cid.strip(),'client_secret':sec.strip()});save_settings(settings);st.rerun()
     if c[1].button('연결 테스트',use_container_width=True):
-        try: call_api(ApiConfig(cid.strip(),sec.strip(),mode),['사과'],(date.today()-timedelta(days=30)).isoformat(),date.today().isoformat(),retries=1);st.success('연결 성공')
+        try:
+            result=call_api(ApiConfig(cid.strip(),sec.strip(),mode),['사과'],(date.today()-timedelta(days=30)).isoformat(),date.today().isoformat(),retries=1)
+            if '사과' not in result or result['사과'].dropna().empty: raise NaverApiError('연결은 되었지만 테스트 데이터가 비어 있습니다.')
+            st.success(f"연결 성공 · 사과 {len(result['사과']):,}일 데이터 확인")
         except Exception as e: st.error(str(e))
     if c[2].button('키 삭제',use_container_width=True): delete_credentials();st.rerun()
     st.caption(f"앱 버전 {APP_VERSION}")

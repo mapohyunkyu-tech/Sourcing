@@ -10,6 +10,8 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import socket
+import urllib3
 
 HUB_URL = "https://naverapihub.apigw.ntruss.com/search-trend/v1/search"
 LEGACY_NCP_URL = "https://naveropenapi.apigw.ntruss.com/datalab/v1/search"
@@ -39,38 +41,134 @@ def chunks(items: List[str], size: int) -> Iterable[List[str]]:
     for i in range(0, len(items), size):
         yield items[i:i+size]
 
-def call_api(config: ApiConfig, keywords: List[str], start_date: str, end_date: str, retries: int = 3) -> Dict[str, pd.Series]:
-    body = {"startDate": start_date, "endDate": end_date, "timeUnit": "date", "keywordGroups": [{"groupName": k, "keywords": [k]} for k in keywords]}
-    last = None
-    for attempt in range(retries):
+def _parse_response(r, config: ApiConfig) -> Dict[str, pd.Series]:
+    """Parse NAVER response or raise a readable application error."""
+    if r.status == 200 if hasattr(r, "status") else r.status_code == 200:
+        payload = r.json() if hasattr(r, "json") else __import__("json").loads(r.data.decode("utf-8"))
+        out = {}
+        for item in payload.get("results", []):
+            s = pd.Series(
+                {row["period"]: float(row["ratio"]) for row in item.get("data", [])},
+                dtype=float,
+                name=item.get("title"),
+            )
+            s.index = pd.to_datetime(s.index)
+            out[item.get("title")] = s.sort_index()
+        return out
+
+    status = r.status if hasattr(r, "status") else r.status_code
+    if hasattr(r, "text"):
+        detail = r.text[:700]
+    else:
+        detail = r.data.decode("utf-8", errors="replace")[:700]
+
+    if status == 401:
+        if "024" in detail:
+            raise NaverApiError("인증 범위 오류(024)입니다. 선택한 인증 방식과 키 발급처가 일치하는지, 해당 애플리케이션에 Search Trend 권한이 연결됐는지 확인하세요.")
+        if '"errorCode":"200"' in detail.replace(" ", "") or "Authentication Failed" in detail:
+            mode_name = {"hub": "NAVER API HUB", "legacy_ncp": "기존 NAVER Cloud Search Trend", "developer": "NAVER Developers"}.get(config.auth_mode, config.auth_mode)
+            raise NaverApiError(
+                f"인증 실패(401/200)입니다. 현재 선택: {mode_name}. "
+                "Client ID·Secret 오타, 키 발급처와 인증 방식 불일치, 폐기·재발급된 키를 확인하세요."
+            )
+    if status == 429:
+        raise NaverApiError(f"HTTP 429: {detail}")
+    if status in (500, 502, 503, 504):
+        raise RuntimeError(f"HTTP {status}: {detail}")
+    raise NaverApiError(f"NAVER API 오류 {status}: {detail}")
+
+
+def _resolve_ipv4_doh(host: str) -> List[str]:
+    """Resolve A records over HTTPS when the hosting provider's DNS/path is unstable."""
+    ips: List[str] = []
+    providers = [
+        ("https://dns.google/resolve", {"name": host, "type": "A"}),
+        ("https://cloudflare-dns.com/dns-query", {"name": host, "type": "A"}),
+    ]
+    for url, params in providers:
         try:
-            r = requests.post(config.url, headers=config.headers, json=body, timeout=45)
-            if r.status_code == 200:
-                out = {}
-                for item in r.json().get("results", []):
-                    s = pd.Series({row["period"]: float(row["ratio"]) for row in item.get("data", [])}, dtype=float, name=item.get("title"))
-                    s.index = pd.to_datetime(s.index)
-                    out[item.get("title")] = s.sort_index()
-                return out
-            detail = r.text[:700]
-            if r.status_code == 401:
-                if "024" in detail:
-                    raise NaverApiError("인증 범위 오류(024)입니다. 선택한 인증 방식과 키 발급처가 일치하는지, 해당 애플리케이션에 Search Trend 권한이 연결됐는지 확인하세요.")
-                if '"errorCode":"200"' in detail.replace(" ", "") or "Authentication Failed" in detail:
-                    mode_name = {"hub": "NAVER API HUB", "legacy_ncp": "기존 NAVER Cloud Search Trend", "developer": "NAVER Developers"}.get(config.auth_mode, config.auth_mode)
-                    raise NaverApiError(
-                        f"인증 실패(401/200)입니다. 현재 선택: {mode_name}. "
-                        "Client ID·Secret 오타, 키 발급처와 인증 방식 불일치, 폐기·재발급된 키를 확인하세요. "
-                        "Streamlit Cloud Secrets에 예전 키가 있으면 설정 탭에 저장한 키보다 우선 적용될 수 있으므로 Secrets도 확인하세요."
-                    )
-            if r.status_code == 429:
-                raise NaverApiError(f"HTTP 429: {detail}")
-            if r.status_code in (500, 502, 503, 504):
-                last = f"HTTP {r.status_code}: {detail}"
-                time.sleep(1.2 * (attempt + 1)); continue
-            raise NaverApiError(f"NAVER API 오류 {r.status_code}: {detail}")
-        except requests.RequestException as exc:
-            last = str(exc); time.sleep(1.2 * (attempt + 1))
+            headers = {"accept": "application/dns-json", "user-agent": "MarketScout/3.7.1"}
+            res = requests.get(url, params=params, headers=headers, timeout=(5, 8))
+            if res.status_code != 200:
+                continue
+            for ans in res.json().get("Answer", []):
+                value = str(ans.get("data", "")).strip()
+                try:
+                    socket.inet_aton(value)
+                except OSError:
+                    continue
+                if value not in ips:
+                    ips.append(value)
+            if ips:
+                break
+        except requests.RequestException:
+            continue
+    return ips
+
+
+def _post_via_ip(config: ApiConfig, body: dict, ip: str) -> Dict[str, pd.Series]:
+    """POST to a resolved IP while preserving TLS SNI and Host validation."""
+    host = "openapi.naver.com"
+    pool = urllib3.HTTPSConnectionPool(
+        ip,
+        port=443,
+        timeout=urllib3.Timeout(connect=8.0, read=45.0),
+        retries=False,
+        assert_hostname=host,
+        server_hostname=host,
+    )
+    headers = dict(config.headers)
+    headers["Host"] = host
+    encoded = __import__("json").dumps(body, ensure_ascii=False).encode("utf-8")
+    response = pool.urlopen(
+        "POST",
+        "/v1/datalab/search",
+        body=encoded,
+        headers=headers,
+        preload_content=True,
+    )
+    return _parse_response(response, config)
+
+
+def call_api(config: ApiConfig, keywords: List[str], start_date: str, end_date: str, retries: int = 3) -> Dict[str, pd.Series]:
+    body = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "timeUnit": "date",
+        "keywordGroups": [{"groupName": k, "keywords": [k]} for k in keywords],
+    }
+    last = None
+    attempts = max(1, int(retries))
+
+    # First use the official hostname normally.
+    for attempt in range(attempts):
+        try:
+            r = requests.post(config.url, headers=config.headers, json=body, timeout=(8, 45))
+            return _parse_response(r, config)
+        except NaverApiError:
+            raise
+        except (requests.RequestException, RuntimeError) as exc:
+            last = str(exc)
+            if attempt + 1 < attempts:
+                time.sleep(1.2 * (attempt + 1))
+
+    # NAVER Developers endpoint only: bypass unstable cloud DNS/routing by
+    # resolving A records over HTTPS, then connect to each IP with correct SNI.
+    if config.auth_mode == "developer":
+        ips = _resolve_ipv4_doh("openapi.naver.com")
+        ip_errors = []
+        for ip in ips:
+            try:
+                return _post_via_ip(config, body, ip)
+            except NaverApiError:
+                raise
+            except Exception as exc:
+                ip_errors.append(f"{ip}: {exc}")
+        if ips:
+            last = f"일반 연결 실패: {last} / 우회 연결 실패: {' | '.join(ip_errors)[:900]}"
+        else:
+            last = f"{last} / HTTPS DNS 우회 주소도 얻지 못했습니다."
+
     raise NaverApiError(f"NAVER API 호출 실패: {last}")
 
 def collect(config: ApiConfig, targets: List[str], start_date: str, end_date: str, progress=None) -> pd.DataFrame:
