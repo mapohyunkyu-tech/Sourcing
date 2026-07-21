@@ -5,18 +5,18 @@ import pandas as pd
 import streamlit as st
 
 from database import (
-    add_item, categories, category_map, get_item_names, load_analysis, load_database_df,
+    add_item, categories, category_map, get_item_names, get_photo_guide, load_analysis, load_database_df,
     save_analysis, search_items, save_raw_series, load_raw_series, cached_keywords,
     backup_database_bytes, restore_database_bytes, enqueue_keywords, next_pending_keywords,
     mark_queue_completed, mark_queue_failed, queue_status_df, queue_counts, reset_failed_queue,
     clear_pending_queue, log_api_call, api_log_df, today_api_calls,
     sync_queue_with_cache, initialize_database, reset_keywords_for_refresh,
-    reset_categories_for_refresh, reset_all_collection_data
+    reset_categories_for_refresh, reset_all_collection_data, update_default_master_assets
 )
 from engine import ApiConfig, NaverApiError, analyze_keyword, call_api, completed_years
 from settings_store import delete_credentials, load_settings, save_settings
 
-APP_VERSION = "3.7.1-naver-network-fallback"
+APP_VERSION = "3.8.0-master-merge-photo-guide"
 st.set_page_config(page_title="MarketScout 시즌 AI v3", page_icon="📈", layout="wide")
 st.title("📈 MarketScout 시즌 AI v3")
 st.caption("오늘 등록·진입·피크·판매잔여일을 한눈에 · 대량수집 이어받기")
@@ -420,6 +420,24 @@ with tabs[2]:
         row=matches.loc[idx]; kw=str(row['검색명']); rep=str(row['대표품목'])
         st.success(f"DB 등록됨 · 대표품목 {rep}")
         st.caption('연결명: '+', '.join(get_item_names(rep)[:50]))
+
+        guide=get_photo_guide(kw,rep)
+        st.markdown("### 📷 사진 활용 가이드")
+        g1,g2=st.columns(2)
+        with g1:
+            st.markdown(f"**같은 품종·동일 유통명**  \n{guide.get('same_variety_names') or '등록 정보 없음'}")
+            st.markdown(f"**겉모양 유사 품종**  \n{guide.get('similar_outer_varieties') or '확인 필요'}")
+            st.markdown(f"**단면 유사 품종**  \n{guide.get('similar_cut_varieties') or '확인 필요'}")
+        with g2:
+            st.markdown(f"**겉색**  \n{guide.get('skin_color') or '확인 필요'}")
+            st.markdown(f"**과육색**  \n{guide.get('flesh_color') or '확인 필요'}")
+            allowed=guide.get('substitute_photo_allowed') or '조건부 가능'
+            if allowed == '가능': st.success(f"사진 대체 사용: {allowed}")
+            elif allowed == '불가': st.error(f"사진 대체 사용: {allowed}")
+            else: st.warning(f"사진 대체 사용: {allowed}")
+        st.info(guide.get('substitute_photo_notes') or '실제 판매 품목과 외형·단면·색상이 일치하는지 확인하세요.')
+        st.caption("※ 대체 사진은 형태 설명용 가이드입니다. 실제 판매 상품 사진으로 오인되지 않도록 상세페이지에 품종·산지·실물 차이를 명확히 표시하세요.")
+
         ys,start,end=years_range(); saved=load_raw_series(kw,start,end)
         if saved is None and kw!=rep: saved=load_raw_series(rep,start,end)
         c1,c2=st.columns(2)
@@ -463,6 +481,38 @@ with tabs[4]:
         except Exception as e: st.error(str(e))
     st.warning('Streamlit Cloud 재배포 시 로컬 DB가 초기화될 수 있으니 수집 후 백업하세요.')
 
+    st.divider()
+    st.subheader("⚙️ 기본 DB 업데이트")
+    st.caption("현재 DB의 활성 품목과 사진 활용 가이드를 item_master.csv에 병합하고, 분석 데이터가 비어 있는 새 설치용 default_market_scout.db를 생성합니다.")
+    st.info("로컬 실행에서는 프로젝트 파일을 즉시 교체합니다. Streamlit Cloud에서는 배포 파일 변경이 재배포 후 사라질 수 있으므로 생성된 두 파일을 내려받아 GitHub 프로젝트에도 교체하세요.")
+    confirm_master=st.checkbox("현재 품목을 기본 마스터에 반영합니다.", key="confirm_default_master_update")
+    if st.button("기본 DB 업데이트 실행", type="primary", disabled=not confirm_master, use_container_width=True, key="run_default_master_update"):
+        try:
+            with st.spinner("현재 품목을 병합하고 새 기본 DB를 만드는 중입니다..."):
+                result=update_default_master_assets()
+                st.session_state["master_update_result"]=result
+            clear_runtime_caches(); db_df_cached.clear(); category_map_cached.clear()
+            where=[]
+            if result.get("csv_written"): where.append("item_master.csv 교체")
+            if result.get("default_db_written"): where.append("기본 DB 교체")
+            suffix=" · ".join(where) if where else "다운로드 파일 생성"
+            st.success(f"완료: 활성 품목 {result['item_count']:,}개 · CSV 신규 병합 {result['added_to_csv']:,}개 · {suffix}")
+        except Exception as e:
+            st.error(f"기본 DB 업데이트 실패: {e}")
+    master_result=st.session_state.get("master_update_result")
+    if master_result:
+        d1,d2=st.columns(2)
+        d1.download_button(
+            "갱신된 item_master.csv 다운로드", master_result["csv_bytes"],
+            file_name="item_master.csv", mime="text/csv", use_container_width=True,
+            key="download_updated_master_csv"
+        )
+        d2.download_button(
+            "갱신된 기본 DB 다운로드", master_result["default_db_bytes"],
+            file_name="default_market_scout.db", mime="application/octet-stream",
+            use_container_width=True, key="download_updated_default_db"
+        )
+
 with tabs[5]:
     modes={'developer':'NAVER Developers 데이터랩','hub':'NAVER API HUB','legacy_ncp':'NAVER Cloud 기존 방식'}
     mode=st.selectbox('인증 방식',list(modes),format_func=lambda x:modes[x],index=list(modes).index(settings.get('auth_mode','developer')) if settings.get('auth_mode','developer') in modes else 0)
@@ -470,10 +520,7 @@ with tabs[5]:
     c=st.columns(3)
     if c[0].button('저장',type='primary',use_container_width=True): settings.update({'auth_mode':mode,'client_id':cid.strip(),'client_secret':sec.strip()});save_settings(settings);st.rerun()
     if c[1].button('연결 테스트',use_container_width=True):
-        try:
-            result=call_api(ApiConfig(cid.strip(),sec.strip(),mode),['사과'],(date.today()-timedelta(days=30)).isoformat(),date.today().isoformat(),retries=1)
-            if '사과' not in result or result['사과'].dropna().empty: raise NaverApiError('연결은 되었지만 테스트 데이터가 비어 있습니다.')
-            st.success(f"연결 성공 · 사과 {len(result['사과']):,}일 데이터 확인")
+        try: call_api(ApiConfig(cid.strip(),sec.strip(),mode),['사과'],(date.today()-timedelta(days=30)).isoformat(),date.today().isoformat(),retries=1);st.success('연결 성공')
         except Exception as e: st.error(str(e))
     if c[2].button('키 삭제',use_container_width=True): delete_credentials();st.rerun()
     st.caption(f"앱 버전 {APP_VERSION}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 import sqlite3
+import shutil
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -10,10 +11,14 @@ DATA_DIR = Path.home() / ".marketscout"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "market_scout.db"
 MASTER_CSV = BASE_DIR / "item_master.csv"
+DEFAULT_DB = BASE_DIR / "default_market_scout.db"
 _SCHEMA_READY = False
 
 def connect(read_only: bool=False):
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # 새 설치에서는 프로젝트에 포함된 기본 DB를 사용자 데이터 폴더로 복사합니다.
+    if not DB_PATH.exists() and DEFAULT_DB.exists():
+        shutil.copy2(DEFAULT_DB, DB_PATH)
     if read_only and DB_PATH.exists():
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=3)
     else:
@@ -41,6 +46,16 @@ def ensure_schema(force: bool = False):
         );
         CREATE INDEX IF NOT EXISTS idx_item_search ON item_names(search_name);
         CREATE INDEX IF NOT EXISTS idx_item_rep ON item_names(representative_name);
+        CREATE TABLE IF NOT EXISTS photo_guides(
+          search_name TEXT PRIMARY KEY,
+          same_variety_names TEXT DEFAULT '',
+          similar_outer_varieties TEXT DEFAULT '',
+          similar_cut_varieties TEXT DEFAULT '',
+          skin_color TEXT DEFAULT '',
+          flesh_color TEXT DEFAULT '',
+          substitute_photo_allowed TEXT DEFAULT '조건부 가능',
+          substitute_photo_notes TEXT DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS analysis_results(
           search_keyword TEXT NOT NULL, target_year INTEGER NOT NULL,
           payload_json TEXT NOT NULL, last_analyzed_at TEXT,
@@ -79,24 +94,34 @@ def _read_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype=str).fillna("")
 
 def import_master_if_empty():
-    with connect() as con:
-        n = con.execute("SELECT COUNT(*) FROM item_names").fetchone()[0]
-        if n: return
+    # CSV 마스터를 DB에 동기화합니다. 기존 DB 데이터는 보존하고 새 행만 추가합니다.
     df = _read_csv(MASTER_CSV)
     required = {"1분류","2분류","3분류_정규화"}
     if not required.issubset(df.columns):
         raise RuntimeError(f"마스터 CSV 열이 다릅니다. 필요: {sorted(required)}")
-    rows=[]
+    rows=[]; guides=[]
     for _,r in df.iterrows():
         name=(r.get("3분류_정규화") or r.get("3분류") or "").strip()
         if not name or str(r.get("검색상태", "사용")).strip() not in ("", "사용"): continue
         row=(r["1분류"].strip(), r["2분류"].strip(), name, r.get("3분류_유형","").strip(), "미정", 1)
         rows.append(row)
-        # 실제 판매자가 자주 쓰는 표기 별칭
+        guides.append((name, r.get("같은품종_동일유통명","").strip(), r.get("겉모양_유사품종","").strip(),
+                       r.get("단면_유사품종","").strip(), r.get("겉색","").strip(), r.get("과육색","").strip(),
+                       r.get("사진대체_가능여부","조건부 가능").strip() or "조건부 가능",
+                       r.get("사진대체_주의사항","").strip()))
         if name == "마늘종":
             rows.append((row[0], row[1], "마늘쫑", "별칭", row[4], row[5]))
     with connect() as con:
         con.executemany("INSERT OR IGNORE INTO item_names(category,representative_name,search_name,name_type,season_type_initial,active) VALUES(?,?,?,?,?,?)", rows)
+        con.executemany('''INSERT INTO photo_guides(search_name,same_variety_names,similar_outer_varieties,similar_cut_varieties,skin_color,flesh_color,substitute_photo_allowed,substitute_photo_notes)
+          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(search_name) DO UPDATE SET
+          same_variety_names=CASE WHEN excluded.same_variety_names!='' THEN excluded.same_variety_names ELSE photo_guides.same_variety_names END,
+          similar_outer_varieties=CASE WHEN excluded.similar_outer_varieties!='' THEN excluded.similar_outer_varieties ELSE photo_guides.similar_outer_varieties END,
+          similar_cut_varieties=CASE WHEN excluded.similar_cut_varieties!='' THEN excluded.similar_cut_varieties ELSE photo_guides.similar_cut_varieties END,
+          skin_color=CASE WHEN excluded.skin_color!='' THEN excluded.skin_color ELSE photo_guides.skin_color END,
+          flesh_color=CASE WHEN excluded.flesh_color!='' THEN excluded.flesh_color ELSE photo_guides.flesh_color END,
+          substitute_photo_allowed=excluded.substitute_photo_allowed,
+          substitute_photo_notes=CASE WHEN excluded.substitute_photo_notes!='' THEN excluded.substitute_photo_notes ELSE photo_guides.substitute_photo_notes END''', guides)
 
 def load_database_df():
     with connect(read_only=True) as con:
@@ -117,11 +142,229 @@ def search_items(query: str):
 def get_item_names(representative_name: str) -> List[str]:
     with connect(read_only=True) as con:return [r[0] for r in con.execute("SELECT search_name FROM item_names WHERE representative_name=? AND active=1 ORDER BY search_name",(representative_name,))]
 
+def get_photo_guide(search_name: str, representative_name: str = "") -> dict:
+    with connect(read_only=True) as con:
+        row=con.execute("SELECT * FROM photo_guides WHERE search_name=?",(search_name,)).fetchone()
+        names=[r[0] for r in con.execute("SELECT search_name FROM item_names WHERE representative_name=? AND active=1 ORDER BY search_name",(representative_name,))] if representative_name else []
+    data=dict(row) if row else {}
+    if not data.get("same_variety_names") and names:
+        data["same_variety_names"]=', '.join(names[:30])
+    data.setdefault("similar_outer_varieties", "확인 필요")
+    data.setdefault("similar_cut_varieties", "확인 필요")
+    data.setdefault("skin_color", "확인 필요")
+    data.setdefault("flesh_color", "확인 필요")
+    data.setdefault("substitute_photo_allowed", "조건부 가능")
+    data.setdefault("substitute_photo_notes", "실제 판매 품목과 겉모양·단면·색이 일치하는지 확인 후 사용")
+    return data
+
 def add_item(category: str, representative_name: str, search_name: Optional[str]=None, season_type: str="미정", name_type: str="대표명") -> int:
     search_name=(search_name or representative_name).strip(); representative_name=representative_name.strip()
     with connect() as con:
         con.execute("INSERT OR IGNORE INTO item_names(category,representative_name,search_name,name_type,season_type_initial,active) VALUES(?,?,?,?,?,1)",(category,representative_name,search_name,name_type,season_type))
         return int(con.execute("SELECT name_id FROM item_names WHERE search_name=?",(search_name,)).fetchone()[0])
+
+
+def update_default_master_assets() -> dict:
+    """현재 DB의 활성 품목을 CSV 마스터와 깨끗한 새 설치용 기본 DB로 내보냅니다.
+
+    프로젝트 폴더가 쓰기 가능한 환경에서는 item_master.csv와
+    default_market_scout.db를 즉시 교체합니다. Streamlit Cloud처럼 배포 파일이
+    일시적일 수 있는 환경에서도 다운로드할 수 있도록 두 파일의 bytes를 반환합니다.
+    """
+    import os
+    import tempfile
+
+    ensure_schema()
+    master = _read_csv(MASTER_CSV) if MASTER_CSV.exists() else pd.DataFrame()
+    columns = [
+        "1분류", "2분류", "3분류", "3분류_정규화", "3분류_유형",
+        "기존_세부분류", "검색상태", "출처URL", "메모", "차수",
+        "같은품종_동일유통명", "겉모양_유사품종", "단면_유사품종",
+        "겉색", "과육색", "사진대체_가능여부", "사진대체_주의사항",
+    ]
+    for col in columns:
+        if col not in master.columns:
+            master[col] = ""
+    master = master[columns].fillna("")
+
+    with connect(read_only=True) as con:
+        items = pd.read_sql_query(
+            """SELECT i.category, i.representative_name, i.search_name,
+                      COALESCE(i.name_type,'') AS name_type,
+                      COALESCE(i.season_type_initial,'미정') AS season_type_initial,
+                      COALESCE(g.same_variety_names,'') AS same_variety_names,
+                      COALESCE(g.similar_outer_varieties,'') AS similar_outer_varieties,
+                      COALESCE(g.similar_cut_varieties,'') AS similar_cut_varieties,
+                      COALESCE(g.skin_color,'') AS skin_color,
+                      COALESCE(g.flesh_color,'') AS flesh_color,
+                      COALESCE(g.substitute_photo_allowed,'') AS substitute_photo_allowed,
+                      COALESCE(g.substitute_photo_notes,'') AS substitute_photo_notes
+               FROM item_names i
+               LEFT JOIN photo_guides g ON g.search_name=i.search_name
+               WHERE i.active=1
+               ORDER BY i.category, i.representative_name, i.search_name""", con
+        )
+
+    by_name = {}
+    for _, row in master.iterrows():
+        name = str(row.get("3분류_정규화") or row.get("3분류") or "").strip()
+        if name and name not in by_name:
+            by_name[name] = {c: str(row.get(c, "") or "") for c in columns}
+
+    added = 0
+    updated = 0
+    for _, r in items.iterrows():
+        name = str(r["search_name"]).strip()
+        existing = by_name.get(name)
+        if existing is None:
+            existing = {c: "" for c in columns}
+            existing.update({
+                "출처URL": "", "메모": "앱에서 추가 후 기본 DB 업데이트",
+                "차수": "앱추가", "검색상태": "사용",
+            })
+            by_name[name] = existing
+            added += 1
+        else:
+            updated += 1
+        existing.update({
+            "1분류": str(r["category"] or ""),
+            "2분류": str(r["representative_name"] or name),
+            "3분류": name,
+            "3분류_정규화": name,
+            "3분류_유형": str(r["name_type"] or existing.get("3분류_유형") or "대표명"),
+            "기존_세부분류": existing.get("기존_세부분류") or str(r["category"] or ""),
+            "검색상태": "사용",
+        })
+        photo_map = {
+            "같은품종_동일유통명": "same_variety_names",
+            "겉모양_유사품종": "similar_outer_varieties",
+            "단면_유사품종": "similar_cut_varieties",
+            "겉색": "skin_color",
+            "과육색": "flesh_color",
+            "사진대체_가능여부": "substitute_photo_allowed",
+            "사진대체_주의사항": "substitute_photo_notes",
+        }
+        for csv_col, db_col in photo_map.items():
+            value = str(r[db_col] or "").strip()
+            if value:
+                existing[csv_col] = value
+
+    merged = pd.DataFrame(by_name.values(), columns=columns).fillna("")
+    merged = merged.drop_duplicates(subset=["3분류_정규화"], keep="last")
+    merged = merged.sort_values(["1분류", "2분류", "3분류_정규화"], kind="stable").reset_index(drop=True)
+    csv_bytes = merged.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+    csv_written = False
+    try:
+        MASTER_CSV.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="item_master_", suffix=".csv", dir=str(MASTER_CSV.parent))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_bytes(csv_bytes)
+        os.replace(tmp_path, MASTER_CSV)
+        csv_written = True
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+    fd, db_tmp_name = tempfile.mkstemp(prefix="default_market_scout_", suffix=".db")
+    os.close(fd)
+    db_tmp = Path(db_tmp_name)
+    try:
+        out = sqlite3.connect(db_tmp)
+        try:
+            out.executescript("""
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE item_names(
+              name_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              category TEXT NOT NULL, representative_name TEXT NOT NULL,
+              search_name TEXT NOT NULL UNIQUE, name_type TEXT,
+              season_type_initial TEXT DEFAULT '미정', active INTEGER DEFAULT 1
+            );
+            CREATE INDEX idx_item_search ON item_names(search_name);
+            CREATE INDEX idx_item_rep ON item_names(representative_name);
+            CREATE TABLE photo_guides(
+              search_name TEXT PRIMARY KEY, same_variety_names TEXT DEFAULT '',
+              similar_outer_varieties TEXT DEFAULT '', similar_cut_varieties TEXT DEFAULT '',
+              skin_color TEXT DEFAULT '', flesh_color TEXT DEFAULT '',
+              substitute_photo_allowed TEXT DEFAULT '조건부 가능', substitute_photo_notes TEXT DEFAULT ''
+            );
+            CREATE TABLE analysis_results(
+              search_keyword TEXT NOT NULL, target_year INTEGER NOT NULL, payload_json TEXT NOT NULL,
+              last_analyzed_at TEXT, PRIMARY KEY(search_keyword,target_year)
+            );
+            CREATE TABLE trend_cache(
+              keyword TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+              series_json TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE collection_queue(
+              keyword TEXT PRIMARY KEY, category TEXT, representative_name TEXT,
+              status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+            CREATE INDEX idx_queue_status ON collection_queue(status);
+            CREATE TABLE api_call_log(
+              log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              called_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+              keyword_count INTEGER NOT NULL, keywords TEXT NOT NULL, result TEXT NOT NULL, detail TEXT
+            );
+            """)
+            item_rows = [tuple(x) for x in items[[
+                "category", "representative_name", "search_name", "name_type", "season_type_initial"
+            ]].itertuples(index=False, name=None)]
+            out.executemany(
+                "INSERT INTO item_names(category,representative_name,search_name,name_type,season_type_initial,active) VALUES(?,?,?,?,?,1)",
+                item_rows,
+            )
+            guide_rows = [tuple(x) for x in items[[
+                "search_name", "same_variety_names", "similar_outer_varieties",
+                "similar_cut_varieties", "skin_color", "flesh_color",
+                "substitute_photo_allowed", "substitute_photo_notes"
+            ]].itertuples(index=False, name=None)]
+            out.executemany(
+                """INSERT INTO photo_guides(search_name,same_variety_names,similar_outer_varieties,
+                   similar_cut_varieties,skin_color,flesh_color,substitute_photo_allowed,substitute_photo_notes)
+                   VALUES(?,?,?,?,?,?,?,?)""", guide_rows
+            )
+            out.commit()
+            check = out.execute("PRAGMA integrity_check").fetchone()[0]
+            if check != "ok":
+                raise RuntimeError(f"새 기본 DB 무결성 검사 실패: {check}")
+        finally:
+            out.close()
+        db_bytes = db_tmp.read_bytes()
+        db_written = False
+        try:
+            DEFAULT_DB.parent.mkdir(parents=True, exist_ok=True)
+            fd2, local_tmp_name = tempfile.mkstemp(prefix="default_db_", suffix=".db", dir=str(DEFAULT_DB.parent))
+            os.close(fd2)
+            local_tmp = Path(local_tmp_name)
+            local_tmp.write_bytes(db_bytes)
+            os.replace(local_tmp, DEFAULT_DB)
+            db_written = True
+        except OSError:
+            try:
+                local_tmp.unlink()
+            except Exception:
+                pass
+    finally:
+        try:
+            db_tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+    return {
+        "item_count": int(len(items)),
+        "csv_row_count": int(len(merged)),
+        "added_to_csv": int(added),
+        "updated_in_csv": int(updated),
+        "csv_bytes": csv_bytes,
+        "default_db_bytes": db_bytes,
+        "csv_written": csv_written,
+        "default_db_written": db_written,
+    }
 
 def save_analysis(result: dict, *_args):
     import json
