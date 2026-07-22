@@ -449,12 +449,21 @@ def save_analysis(result: dict, *_args):
 
 def load_analysis(keyword: Optional[str]=None,target_year: Optional[int]=None):
     import json
+    ensure_schema()
     where=[]; params=[]
     if keyword: where.append("search_keyword=?");params.append(keyword)
     if target_year: where.append("target_year=?");params.append(target_year)
     sql="SELECT payload_json FROM analysis_results"+(" WHERE "+" AND ".join(where) if where else "")+" ORDER BY last_analyzed_at DESC"
-    with connect(read_only=True) as con: rows=con.execute(sql,params).fetchall()
-    return pd.DataFrame([json.loads(r[0]) for r in rows])
+    try:
+        with connect(read_only=True) as con:
+            rows=con.execute(sql,params).fetchall()
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError("복원된 DB를 읽지 못했습니다. 예전 WAL/SHM 파일 충돌 또는 손상 가능성이 있습니다. 수정 버전에서 DB를 다시 복원해 주세요.") from e
+    records=[]
+    for r in rows:
+        try: records.append(json.loads(r[0]))
+        except (TypeError, json.JSONDecodeError): continue
+    return pd.DataFrame(records)
 
 # ---------------- persistent trend cache / backup ----------------
 def save_raw_series(keyword: str, series: pd.Series, start_date: str, end_date: str):
@@ -496,21 +505,42 @@ def backup_database_bytes() -> bytes:
         except FileNotFoundError: pass
 
 def restore_database_bytes(data: bytes):
+    """Safely replace the active DB, including cleanup of stale WAL/SHM files."""
     import tempfile, os
+    global _SCHEMA_READY
     fd,tmp=tempfile.mkstemp(suffix='.db'); os.close(fd)
+    tmp_path=Path(tmp)
     try:
-        Path(tmp).write_bytes(data)
+        tmp_path.write_bytes(data)
         test=sqlite3.connect(tmp)
         try:
             ok=test.execute('PRAGMA integrity_check').fetchone()[0]
-            if ok != 'ok': raise RuntimeError(f'DB 무결성 검사 실패: {ok}')
-        finally: test.close()
+            if ok != 'ok':
+                raise RuntimeError(f'DB 무결성 검사 실패: {ok}')
+            tables={r[0] for r in test.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'item_names' not in tables:
+                raise RuntimeError('MarketScout DB가 아닙니다: item_names 테이블이 없습니다.')
+        finally:
+            test.close()
+
         DB_PATH.parent.mkdir(parents=True,exist_ok=True)
-        Path(tmp).replace(DB_PATH)
+        # A restored main DB must never be opened with WAL/SHM sidecars from the old DB.
+        for sidecar in (Path(str(DB_PATH)+'-wal'), Path(str(DB_PATH)+'-shm')):
+            try: sidecar.unlink()
+            except FileNotFoundError: pass
+        os.replace(tmp, DB_PATH)
+        for sidecar in (Path(str(DB_PATH)+'-wal'), Path(str(DB_PATH)+'-shm')):
+            try: sidecar.unlink()
+            except FileNotFoundError: pass
+        _SCHEMA_READY=False
+        ensure_schema(force=True)
+        with connect() as con:
+            ok=con.execute('PRAGMA integrity_check').fetchone()[0]
+            if ok != 'ok':
+                raise RuntimeError(f'복원 후 DB 무결성 검사 실패: {ok}')
     finally:
-        try: Path(tmp).unlink()
+        try: tmp_path.unlink()
         except FileNotFoundError: pass
-    ensure_schema(force=True)
 
 # ---------------- bulk collection resume / logs ----------------
 def ensure_bulk_schema():
